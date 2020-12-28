@@ -5,7 +5,7 @@ This is a naive brute force approach for finding outliers using the GPU.
 # Compile
 
 ```
-mkdir release
+mkdir release && cd release
 cmake .. -DCMAKE_BUILD_TYPE=Release -DSM_ARCH=61 # for Compute Capability 6.1
 make -j 4
 ```
