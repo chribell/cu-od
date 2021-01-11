@@ -15,9 +15,10 @@ struct filter {
     }
 };
 
-__global__ void computeEuclideanParallel(const float* pointsRow, const float* pointsCol, unsigned int cardinality,
-                                         unsigned int dimensions, unsigned int chunkSize, unsigned int offset,
-                                         unsigned int size, double threshold, unsigned int* neighbors);
+template <typename T, bool weighted>
+__global__ void computeEuclideanParallel(const T* pointsRow, const T* pointsCol, const T* weights,
+                                         unsigned int cardinality, unsigned int dimensions, unsigned int chunkSize,
+                                         unsigned int offset, unsigned int size, double threshold, unsigned int* neighbors);
 
 int main(int argc, char** argv) {
     try {
@@ -32,6 +33,8 @@ int main(int argc, char** argv) {
         // arguments
         std::string input;
         std::string output = "out.txt";
+        std::string weightsFile;
+        bool hasWeights = false;
         unsigned int cardinality;
         unsigned int dimensions;
         unsigned int blocks = multiprocessorCount * 16;
@@ -54,6 +57,7 @@ int main(int argc, char** argv) {
                 ("d,dimensions", "Point dimensionality", cxxopts::value<unsigned int>(dimensions))
                 ("k", "Minimum number of neighbors to consider a point inlier", cxxopts::value<unsigned int>(k))
                 ("t,threshold", "Threshold value (default: 2.0)", cxxopts::value<double>(threshold))
+                ("weights", "Weight file (the number of weights must be equal to the number of dimensions)", cxxopts::value<std::string>(weightsFile))
                 // GPU related arguments
                 ("chunk", "Chunk size (points assigned per blocked)", cxxopts::value<unsigned int>(chunkSize))
                 ("blocks", "Number of blocks (default: " + std::to_string(blocks) + ")", cxxopts::value<unsigned int>(blocks))
@@ -87,6 +91,13 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        float* weights = new float[dimensions]{1.00};
+
+        if (result.count("weights")) {
+            hasWeights = true;
+            readWeights(weightsFile, weights);
+        }
+
         Dataset* d = readDataset(input, cardinality, dimensions);
 
         fmt::print(
@@ -117,11 +128,13 @@ int main(int argc, char** argv) {
 
         float* devicePointsRow;
         float* devicePointsCol;
+        float* deviceWeights;
         unsigned int* deviceNeighbors;
 
         EventPair* devMemAlloc = deviceTimer.add("Device memory allocation");
         errorCheck(cudaMalloc((void**) &devicePointsRow, sizeof(float) * d->cardinality * d->dimensions))
         errorCheck(cudaMalloc((void**) &devicePointsCol, sizeof(float) * d->cardinality * d->dimensions))
+        errorCheck(cudaMalloc((void**) &deviceWeights, sizeof(float) * d->dimensions))
         errorCheck(cudaMalloc((void**) &deviceNeighbors, sizeof(unsigned int) * windowSize))
         DeviceTimer::finish(devMemAlloc);
 
@@ -130,10 +143,13 @@ int main(int argc, char** argv) {
                               cudaMemcpyHostToDevice))
         errorCheck(cudaMemcpy(devicePointsCol, d->pointsCol, sizeof(float) * d->cardinality * d->dimensions,
                               cudaMemcpyHostToDevice))
+        errorCheck(cudaMemcpy(deviceWeights, weights, sizeof(float) * d->dimensions,
+                              cudaMemcpyHostToDevice))
         DeviceTimer::finish(dataTransfer);
 
         unsigned int sharedMem = 2 * chunkSize * d->dimensions * sizeof(float);
-        cudaFuncSetCacheConfig(computeEuclideanParallel, cudaFuncCachePreferL1);
+        cudaFuncSetCacheConfig(computeEuclideanParallel<float, true>, cudaFuncCachePreferL1);
+        cudaFuncSetCacheConfig(computeEuclideanParallel<float, false>, cudaFuncCachePreferL1);
 
         unsigned int currentSize = 0;
         unsigned int currentStart = 0;
@@ -154,17 +170,32 @@ int main(int argc, char** argv) {
 
 
             EventPair* calc = deviceTimer.add("Kernel");
-            computeEuclideanParallel<<<currentSize / chunkSize, dimensions, sharedMem>>>(
-                                                                                            devicePointsRow,
-                                                                                            devicePointsCol,
-                                                                                            d->cardinality,
-                                                                                            d->dimensions,
-                                                                                            chunkSize,
-                                                                                            (currentStart * slideSize),
-                                                                                            currentSize,
-                                                                                            threshold,
-                                                                                            deviceNeighbors);
 
+            if (hasWeights) {
+                computeEuclideanParallel<float, true><<<currentSize / chunkSize, dimensions, sharedMem>>>(
+                        devicePointsRow,
+                        devicePointsCol,
+                        deviceWeights,
+                        d->cardinality,
+                        d->dimensions,
+                        chunkSize,
+                        (currentStart * slideSize),
+                        currentSize,
+                        threshold,
+                        deviceNeighbors);
+            } else {
+                computeEuclideanParallel<float, false><<<currentSize / chunkSize, dimensions, sharedMem>>>(
+                        devicePointsRow,
+                        devicePointsCol,
+                        deviceWeights,
+                        d->cardinality,
+                        d->dimensions,
+                        chunkSize,
+                        (currentStart * slideSize),
+                        currentSize,
+                        threshold,
+                        deviceNeighbors);
+            }
 
             unsigned int deviceRes = thrust::transform_reduce(thrust::device, deviceNeighbors,
                                                               deviceNeighbors + currentSize, filter(k), 0,
@@ -193,13 +224,13 @@ int main(int argc, char** argv) {
     return 0;
 }
 
-
-__global__ void computeEuclideanParallel(const float* pointsRow, const float* pointsCol, unsigned int cardinality,
-                                         unsigned int dimensions, unsigned int chunkSize, unsigned int offset,
-                                         unsigned int size, double threshold, unsigned int* neighbors) {
-    extern float __shared__ s[];
-    float* sharedPoints = s;
-    float* result = (float*) &sharedPoints[chunkSize * dimensions] + threadIdx.x * chunkSize;
+template <typename T, bool weighted>
+__global__ void computeEuclideanParallel(const T* pointsRow, const T* pointsCol, const T* weights,
+                                         unsigned int cardinality, unsigned int dimensions, unsigned int chunkSize,
+                                         unsigned int offset, unsigned int size, double threshold, unsigned int* neighbors) {
+    extern T __shared__ s[];
+    T* sharedPoints = s;
+    T* result = (T*) &sharedPoints[chunkSize * dimensions] + threadIdx.x * chunkSize;
 
     unsigned int bx = blockIdx.x;
 
@@ -217,7 +248,11 @@ __global__ void computeEuclideanParallel(const float* pointsRow, const float* po
                 float tmp = pointsCol[(cardinality * i + offset) + tx];
                 for (int j = 0; j < chunkSize; j++) {
                     float res = tmp - sharedPoints[i + (j * dimensions)];
-                    result[j] += res * res;
+                    if(weighted) {
+                        result[j] += (res * res) * weights[i];
+                    } else {
+                        result[j] += res * res;
+                    }
                 }
             }
             for (int i = 0; i < chunkSize; i++) {

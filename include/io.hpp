@@ -75,6 +75,21 @@ Dataset* readDataset(std::string& path, unsigned int cardinality, unsigned int d
     return d;
 }
 
+void readWeights(std::string& path, float* weights) {
+    std::ifstream infile;
+    std::string line;
+    infile.open(path.c_str());
+
+    std::getline(infile, line);
+
+    std::vector<float> v = split(line, ',');
+    for (unsigned int i = 0; i < v.size(); ++i) {
+        weights[i] = v[i];
+    }
+
+    infile.close();
+}
+
 void writeResult(std::vector<unsigned int> counts, std::string& output) {
     std::ofstream file;
     file.open(output.c_str());
