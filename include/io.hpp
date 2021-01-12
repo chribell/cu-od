@@ -90,12 +90,23 @@ void readWeights(std::string& path, float* weights) {
     infile.close();
 }
 
-void writeResult(std::vector<unsigned int> counts, std::string& output) {
+void writeCountsResult(std::vector<unsigned int> counts, std::string& output) {
     std::ofstream file;
     file.open(output.c_str());
 
     for (unsigned int i = 0; i < counts.size(); ++i) {
         fmt::print(file, "Run({}): {}\n", i, counts[i]);
+    }
+
+    file.close();
+}
+
+void writeOutliersResult(std::vector<unsigned int> outliers, std::string& output) {
+    std::ofstream file;
+    file.open(output.c_str());
+
+    for (unsigned int i = 0; i < outliers.size(); ++i) {
+        fmt::print(file, "{}\n", outliers[i]);
     }
 
     file.close();

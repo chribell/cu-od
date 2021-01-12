@@ -1,6 +1,9 @@
 #include <iostream>
 #include <cxxopts.hpp>
 #include <thrust/reduce.h>
+#include <thrust/copy.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/device_ptr.h>
 #include "io.hpp"
 #include "device_timer.cuh"
 #include "helpers.cuh"
@@ -130,12 +133,14 @@ int main(int argc, char** argv) {
         float* devicePointsCol;
         float* deviceWeights;
         unsigned int* deviceNeighbors;
+        unsigned int* deviceOutliers;
 
         EventPair* devMemAlloc = deviceTimer.add("Device memory allocation");
         errorCheck(cudaMalloc((void**) &devicePointsRow, sizeof(float) * d->cardinality * d->dimensions))
         errorCheck(cudaMalloc((void**) &devicePointsCol, sizeof(float) * d->cardinality * d->dimensions))
         errorCheck(cudaMalloc((void**) &deviceWeights, sizeof(float) * d->dimensions))
         errorCheck(cudaMalloc((void**) &deviceNeighbors, sizeof(unsigned int) * windowSize))
+        errorCheck(cudaMalloc((void**) &deviceOutliers, sizeof(unsigned int) * windowSize))
         DeviceTimer::finish(devMemAlloc);
 
         EventPair* dataTransfer = deviceTimer.add("Transfer to device");
@@ -155,6 +160,7 @@ int main(int argc, char** argv) {
         unsigned int currentStart = 0;
 
         std::vector<unsigned int> counts;
+        std::vector<unsigned int> outliers;
 
         for (unsigned int i = 0; i < (cardinality / slideSize) + (cardinality % slideSize != 0 ? 1 : 0); ++i) {
 
@@ -167,7 +173,6 @@ int main(int argc, char** argv) {
             EventPair* clearMem = deviceTimer.add("Clear neighbors");
             errorCheck(cudaMemset(deviceNeighbors, 0, sizeof(unsigned int) * currentSize))
             DeviceTimer::finish(clearMem);
-
 
             EventPair* calc = deviceTimer.add("Kernel");
 
@@ -197,10 +202,24 @@ int main(int argc, char** argv) {
                         deviceNeighbors);
             }
 
+            DeviceTimer::finish(calc);
+
+            EventPair* extractResults = deviceTimer.add("Extract results");
             unsigned int deviceRes = thrust::transform_reduce(thrust::device, deviceNeighbors,
                                                               deviceNeighbors + currentSize, filter(k), 0,
                                                               thrust::plus<unsigned int>());
-            DeviceTimer::finish(calc);
+
+            thrust::copy_if(thrust::make_counting_iterator<unsigned int>((currentStart * slideSize)),
+                            thrust::make_counting_iterator<unsigned int>((currentStart * slideSize) + currentSize),
+                            thrust::device_ptr<unsigned int>(deviceNeighbors),
+                            thrust::device_ptr<unsigned int>(deviceOutliers),
+                            filter(k));
+
+            std::vector<unsigned int> tmp(deviceRes);
+            errorCheck(cudaMemcpy(&tmp[0], deviceOutliers, sizeof(unsigned int) * deviceRes, cudaMemcpyDeviceToHost))
+            DeviceTimer::finish(extractResults);
+
+            outliers.insert(outliers.end(), tmp.begin(), tmp.end());
             counts.push_back(deviceRes);
         }
 
@@ -213,8 +232,18 @@ int main(int argc, char** argv) {
         cudaDeviceSynchronize();
         deviceTimer.print();
 
-        fmt::print("Writing results to {}\n", output);
-        writeResult(counts, output);
+        fmt::print("┌{0:─^{1}}┐\n"
+                "│{3: ^{2}}|{4: ^{2}}│\n"
+                "└{5:─^{1}}┘\n", "Result", 51, 25,
+                "Total outliers", outliers.size(), ""
+        );
+
+        fmt::print("Writing outliers to {}\n", std::string("outliers_").append(output));
+        writeOutliersResult(outliers, std::string("outliers_").append(output));
+
+        fmt::print("Writing counts to {}\n", std::string("counts_").append(output));
+        writeCountsResult(counts, std::string("counts_").append(output));
+
         fmt::print("Finished!\n");
 
     } catch (const cxxopts::OptionException& e) {
