@@ -152,7 +152,6 @@ int main(int argc, char** argv) {
                               cudaMemcpyHostToDevice))
         DeviceTimer::finish(dataTransfer);
 
-        unsigned int sharedMem = 2 * chunkSize * d->dimensions * sizeof(float);
         cudaFuncSetCacheConfig(computeEuclideanParallel<float, true>, cudaFuncCachePreferL1);
         cudaFuncSetCacheConfig(computeEuclideanParallel<float, false>, cudaFuncCachePreferL1);
 
@@ -176,6 +175,14 @@ int main(int argc, char** argv) {
 
             EventPair* calc = deviceTimer.add("Kernel");
 
+            unsigned int offset = currentStart * slideSize;
+            unsigned int currentEnd = offset + currentSize;
+            unsigned int sharedMem = 2 * chunkSize * d->dimensions * sizeof(float);
+
+            if (currentEnd > cardinality) { // last iteration
+                currentSize = currentSize - (currentEnd - cardinality);
+            }
+
             if (hasWeights) {
                 computeEuclideanParallel<float, true><<<currentSize / chunkSize, dimensions, sharedMem>>>(
                         devicePointsRow,
@@ -184,7 +191,7 @@ int main(int argc, char** argv) {
                         d->cardinality,
                         d->dimensions,
                         chunkSize,
-                        (currentStart * slideSize),
+                        offset,
                         currentSize,
                         threshold,
                         deviceNeighbors);
@@ -196,7 +203,7 @@ int main(int argc, char** argv) {
                         d->cardinality,
                         d->dimensions,
                         chunkSize,
-                        (currentStart * slideSize),
+                        offset,
                         currentSize,
                         threshold,
                         deviceNeighbors);
@@ -209,8 +216,8 @@ int main(int argc, char** argv) {
                                                               deviceNeighbors + currentSize, filter(k), 0,
                                                               thrust::plus<unsigned int>());
 
-            thrust::copy_if(thrust::make_counting_iterator<unsigned int>((currentStart * slideSize)),
-                            thrust::make_counting_iterator<unsigned int>((currentStart * slideSize) + currentSize),
+            thrust::copy_if(thrust::make_counting_iterator<unsigned int>((currentStart * slideSize) + 1),
+                            thrust::make_counting_iterator<unsigned int>((currentStart * slideSize) + currentSize + 1),
                             thrust::device_ptr<unsigned int>(deviceNeighbors),
                             thrust::device_ptr<unsigned int>(deviceOutliers),
                             filter(k));
