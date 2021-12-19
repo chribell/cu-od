@@ -10,85 +10,84 @@
 #include <fmt/core.h>
 #include <fmt/ostream.h>
 
-struct Dataset {
-    unsigned int cardinality;
-    unsigned int dimensions;
-    float* pointsRow;
-    float* pointsCol;
 
-    ~Dataset() {
-        delete[] pointsRow;
-        delete[] pointsCol;
-    }
-};
-
-
-std::vector<float> split(const std::string& s, char delimiter) {
+template<typename T>
+std::vector<T> split(const std::string& s, char delimiter) {
     std::stringstream ss(s);
     std::string item;
-    std::vector<float> elements;
+    std::vector<T> elements;
     while (std::getline(ss, item, delimiter)) {
-        elements.push_back(std::stof(item));
+        elements.push_back(typeid(T) == typeid(float) ? std::stof(item) : std::stod(item));
     }
     return elements;
 }
 
-Dataset* readDataset(std::string& path, unsigned int cardinality, unsigned int dimensions) {
-    auto d = new Dataset;
-    d->cardinality = cardinality;
-    d->dimensions = dimensions;
+template<class T>
+struct Dataset {
+    unsigned int cardinality;
+    unsigned int dimensions;
+    T* pointsRow;
+    T* pointsCol;
+    T* weights;
 
-    std::ifstream infile;
-    std::string line;
-    infile.open(path.c_str());
-    if (infile.fail()) {
-        fmt::print("{}\n", "Wrong input dataset! Exiting...");
-        exit(1);
+    Dataset(std::string& path, unsigned int cardinality, unsigned int dimensions) : cardinality(cardinality),
+                                                                                    dimensions(dimensions) {
+        std::ifstream infile;
+        std::string line;
+        infile.open(path.c_str());
+        if (infile.fail()) {
+            fmt::print("{}\n", "Wrong input dataset! Exiting...");
+            exit(1);
+        }
+
+        this->pointsRow = new T[this->cardinality * this->dimensions];
+
+        unsigned int i = 0;
+
+        while (!infile.eof()) {
+            std::getline(infile, line);
+            if (line.empty()) continue;
+            std::vector<T> v = split<T>(line, ',');
+            for (auto& point: v) {
+                this->pointsRow[i++] = point;
+            }
+        }
+
+        infile.close();
+
+        // Additionally, store dataset in column format to achieve better memory access in GPU
+        this->pointsCol = new T[this->cardinality * this->dimensions];
+
+        for (i = 0; i < this->cardinality; i++) {
+            for (unsigned int j = 0; j < this->dimensions; j++) {
+                this->pointsCol[(j * this->cardinality) + i] = this->pointsRow[(i * this->dimensions) + j];
+            }
+        }
     }
 
-    d->pointsRow = new float[d->cardinality * d->dimensions];
+    void readWeights(std::string& path) {
+        weights = new T[this->dimensions]{1.00};
+        std::ifstream infile;
+        std::string line;
+        infile.open(path.c_str());
 
-    unsigned int i = 0;
-
-    while (!infile.eof()) {
         std::getline(infile, line);
-        if (line.empty()) continue;
 
-        std::vector<float> v = split(line, ',');
-
-        for(auto& point : v) {
-            d->pointsRow[i++] = point;
+        std::vector<T> v = split<T>(line, ',');
+        for (unsigned int i = 0; i < v.size(); ++i) {
+            weights[i] = v[i];
         }
+
+        infile.close();
     }
 
-    infile.close();
-
-    // Additionally, store dataset in column format to achieve better memory access in GPU
-    d->pointsCol = new float[d->cardinality * d->dimensions];
-
-    for (i = 0; i < d->cardinality; i++) {
-        for (unsigned int j = 0; j < d->dimensions; j++) {
-            d->pointsCol[(j * d->cardinality) + i] = d->pointsRow[(i * d->dimensions) + j];
-        }
+    ~Dataset() {
+        delete[] pointsRow;
+        delete[] pointsCol;
+        delete[] weights;
     }
+};
 
-    return d;
-}
-
-void readWeights(std::string& path, float* weights) {
-    std::ifstream infile;
-    std::string line;
-    infile.open(path.c_str());
-
-    std::getline(infile, line);
-
-    std::vector<float> v = split(line, ',');
-    for (unsigned int i = 0; i < v.size(); ++i) {
-        weights[i] = v[i];
-    }
-
-    infile.close();
-}
 
 void writeCountsResult(std::vector<unsigned int> counts, std::string& output) {
     std::ofstream file;
