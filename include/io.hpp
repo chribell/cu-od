@@ -7,6 +7,7 @@
 #include <sstream>
 #include <fstream>
 #include <vector>
+#include <set>
 #include <fmt/core.h>
 #include <fmt/ostream.h>
 
@@ -30,8 +31,8 @@ struct Dataset {
     T* pointsCol;
     T* weights;
 
-    Dataset(std::string& path, unsigned int cardinality, unsigned int dimensions) : cardinality(cardinality),
-                                                                                    dimensions(dimensions) {
+    Dataset(std::string& path, unsigned int cardinality, unsigned int dimensions, bool skipHeader) :
+            cardinality(cardinality), dimensions(dimensions) {
         std::ifstream infile;
         std::string line;
         infile.open(path.c_str());
@@ -43,6 +44,8 @@ struct Dataset {
         this->pointsRow = new T[this->cardinality * this->dimensions];
 
         unsigned int i = 0;
+
+        if (skipHeader) std::getline(infile, line);
 
         while (!infile.eof()) {
             std::getline(infile, line);
@@ -87,6 +90,24 @@ struct Dataset {
         delete[] weights;
     }
 };
+
+std::set<unsigned int> readGroundTruth(std::string& path) {
+    std::set<unsigned int> ids;
+    std::ifstream infile;
+    std::string line;
+    infile.open(path.c_str());
+
+    std::getline(infile, line);
+
+    while (!infile.eof()) {
+        std::getline(infile, line);
+        if (line.empty()) continue;
+        ids.insert(std::stoi(line));
+    }
+
+    infile.close();
+    return ids;
+}
 
 
 void writeCountsResult(std::vector<unsigned int> counts, std::string& output) {

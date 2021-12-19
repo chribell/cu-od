@@ -7,14 +7,17 @@
 #include "io.hpp"
 #include "device_timer.cuh"
 #include "helpers.cuh"
+#include <fmt/ranges.h>
 
 struct Args {
     int multiprocessorCount{};
     int maxThreadsPerBlock{};
     std::string input;
-    std::string output = "out.txt";
+    std::string output;
     std::string weightsFile;
+    std::string groundTruthFile;
     std::string precision = "float";
+    bool skipHeader = false;
     bool hasWeights = false;
     unsigned int cardinality{};
     unsigned int dimensions{};
@@ -22,7 +25,7 @@ struct Args {
     unsigned int windowSize = 10000;
     unsigned int slideSize = 500;
     unsigned int k = 50;
-    double threshold = 2.0;
+    std::vector<double> threshold;
     unsigned int blocks{};
     unsigned int blockSize{};
 };
@@ -44,7 +47,7 @@ __global__ void computeEuclideanParallel(const T* pointsRow, const T* pointsCol,
                                          unsigned int* neighbors);
 
 template<typename T>
-void processDataset(Dataset<T>* dataset, const Args& args);
+void processDataset(Dataset<T>* dataset, const Args& args, std::set<unsigned int>& groundTruth);
 
 int main(int argc, char** argv) {
     try {
@@ -64,6 +67,7 @@ int main(int argc, char** argv) {
                 ("i,input", "Input dataset path", cxxopts::value<std::string>(args.input))
                 ("o,output", "Output result path", cxxopts::value<std::string>(args.output))
                 ("p,precision", "Precision type", cxxopts::value<std::string>(args.precision))
+                ("skip-header", "Skip input dataset header", cxxopts::value<bool>(args.skipHeader))
                 // Outlier detection related arguments
                 ("w,window", "Window size (must be multiple of slide, default: 10000)",
                  cxxopts::value<unsigned int>(args.windowSize))
@@ -71,9 +75,11 @@ int main(int argc, char** argv) {
                 ("c,cardinality", "Dataset cardinality", cxxopts::value<unsigned int>(args.cardinality))
                 ("d,dimensions", "Point dimensionality", cxxopts::value<unsigned int>(args.dimensions))
                 ("k", "Minimum number of neighbors to consider a point inlier", cxxopts::value<unsigned int>(args.k))
-                ("t,threshold", "Threshold value (default: 2.0)", cxxopts::value<double>(args.threshold))
+                ("t,threshold", "Threshold value (default: 2.0)", cxxopts::value<std::vector<double>>(args.threshold))
                 ("weights", "Weight file (the number of weights must be equal to the number of dimensions)",
                  cxxopts::value<std::string>(args.weightsFile))
+                ("ground-truth", "Ground truth file (the outlier ids)",
+                 cxxopts::value<std::string>(args.groundTruthFile))
                 // GPU related arguments
                 ("chunk", "Chunk size (points assigned per blocked)", cxxopts::value<unsigned int>(args.chunkSize))
                 ("blocks", "Number of blocks (default: " + std::to_string(args.blocks) + ")",
@@ -104,6 +110,11 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        if (args.threshold.empty()) {
+            fmt::print("{}\n", "No thresholds given! Exiting...");
+            return 1;
+        }
+
         if (args.windowSize % args.slideSize != 0) {
             fmt::print("{}\n", "Error, window size must be multiple of slide size! Exiting...");
             return 1;
@@ -113,10 +124,21 @@ int main(int argc, char** argv) {
             args.hasWeights = true;
         }
 
+
+        std::set<unsigned int> groundTruth;
+
+        if (result.count("ground-truth")) {
+            groundTruth = readGroundTruth(args.groundTruthFile);
+        }
+
         if (args.precision == "float") {
-            processDataset<float>(new Dataset<float>(args.input, args.cardinality, args.dimensions), args);
+            processDataset<float>(new Dataset<float>(args.input, args.cardinality, args.dimensions, args.skipHeader),
+                                  args,
+                                  groundTruth);
         } else {
-            processDataset<double>(new Dataset<double>(args.input, args.cardinality, args.dimensions), args);
+            processDataset<double>(new Dataset<double>(args.input, args.cardinality, args.dimensions, args.skipHeader),
+                                   args,
+                                   groundTruth);
         }
 
         fmt::print("Finished!\n");
@@ -190,20 +212,7 @@ __global__ void computeEuclideanParallel(const T* pointsRow, const T* pointsCol,
 }
 
 template<typename T>
-void processDataset(Dataset<T>* dataset, const Args& args) {
-
-    fmt::print(
-            "┌{0:─^{1}}┐\n"
-            "│{3: ^{2}}|{4: ^{2}}│\n"
-            "│{5: ^{2}}|{6: ^{2}}│\n"
-            "│{7: ^{2}}|{8: ^{2}}│\n"
-            "│{9: ^{2}}|{10: ^{2}}│\n"
-            "└{11:─^{1}}┘\n", "Query", 51, 25,
-            "Window size (w)", args.windowSize,
-            "Slide size (s)", args.slideSize,
-            "Min. neighbors (k)", args.k,
-            "Threshold", args.threshold, ""
-    );
+void processDataset(Dataset<T>* dataset, const Args& args, std::set<unsigned int>& groundTruth) {
 
     fmt::print(
             "┌{0:─^{1}}┐\n"
@@ -253,81 +262,153 @@ void processDataset(Dataset<T>* dataset, const Args& args) {
     cudaFuncSetCacheConfig(computeEuclideanParallel<double, true>, cudaFuncCachePreferL1);
     cudaFuncSetCacheConfig(computeEuclideanParallel<double, false>, cudaFuncCachePreferL1);
 
-    unsigned int currentSize = 0;
-    unsigned int currentStart = 0;
+    for (auto& t: args.threshold) {
+        unsigned int currentSize = 0;
+        unsigned int currentStart = 0;
 
-    std::vector<unsigned int> counts;
-    std::vector<unsigned int> outliers;
+        std::vector<unsigned int> counts;
+        std::vector<unsigned int> outliers;
 
-    for (unsigned int i = 0;
-         i < (args.cardinality / args.slideSize) + (args.cardinality % args.slideSize != 0 ? 1 : 0); ++i) {
+        for (unsigned int i = 0;
+             i < (args.cardinality / args.slideSize) + (args.cardinality % args.slideSize != 0 ? 1 : 0); ++i) {
 
-        if (currentSize < args.windowSize) {
-            currentSize += args.slideSize;
-        } else {
-            currentStart++;
+            if (currentSize < args.windowSize) {
+                currentSize += args.slideSize;
+            } else {
+                currentStart++;
+            }
+
+            EventPair* clearMem = deviceTimer.add("Clear neighbors");
+            errorCheck(cudaMemset(deviceNeighbors, 0, sizeof(unsigned int) * currentSize))
+            DeviceTimer::finish(clearMem);
+
+            EventPair* calc = deviceTimer.add("Kernel");
+
+            unsigned int offset = currentStart * args.slideSize;
+            unsigned int currentEnd = offset + currentSize;
+            unsigned int sharedMem = 2 * args.chunkSize * dataset->dimensions * sizeof(T);
+
+            if (currentEnd > args.cardinality) { // last iteration
+                currentSize = currentSize - (currentEnd - args.cardinality);
+            }
+
+            if (args.hasWeights) {
+                computeEuclideanParallel<T, true><<<currentSize / args.chunkSize, args.dimensions, sharedMem>>>(
+                        devicePointsRow,
+                        devicePointsCol,
+                        deviceWeights,
+                        dataset->cardinality,
+                        dataset->dimensions,
+                        args.chunkSize,
+                        offset,
+                        currentSize,
+                        t,
+                        deviceNeighbors);
+            } else {
+                computeEuclideanParallel<T, false><<<currentSize / args.chunkSize, args.dimensions, sharedMem>>>(
+                        devicePointsRow,
+                        devicePointsCol,
+                        deviceWeights,
+                        dataset->cardinality,
+                        dataset->dimensions,
+                        args.chunkSize,
+                        offset,
+                        currentSize,
+                        t,
+                        deviceNeighbors);
+            }
+
+            DeviceTimer::finish(calc);
+
+            EventPair* extractResults = deviceTimer.add("Extract results");
+            unsigned int deviceRes = thrust::transform_reduce(thrust::device, deviceNeighbors,
+                                                              deviceNeighbors + currentSize, filter(args.k), 0,
+                                                              thrust::plus<unsigned int>());
+
+            thrust::copy_if(thrust::make_counting_iterator<unsigned int>((currentStart * args.slideSize) + 1),
+                            thrust::make_counting_iterator<unsigned int>(
+                                    (currentStart * args.slideSize) + currentSize + 1),
+                            thrust::device_ptr<unsigned int>(deviceNeighbors),
+                            thrust::device_ptr<unsigned int>(deviceOutliers),
+                            filter(args.k));
+
+            std::vector<unsigned int> tmp(deviceRes);
+            errorCheck(cudaMemcpy(&tmp[0], deviceOutliers, sizeof(unsigned int) * deviceRes, cudaMemcpyDeviceToHost))
+            DeviceTimer::finish(extractResults);
+
+            outliers.insert(outliers.end(), tmp.begin(), tmp.end());
+            counts.push_back(deviceRes);
         }
 
-        EventPair* clearMem = deviceTimer.add("Clear neighbors");
-        errorCheck(cudaMemset(deviceNeighbors, 0, sizeof(unsigned int) * currentSize))
-        DeviceTimer::finish(clearMem);
+        std::set<unsigned int> s;
+        for (unsigned int& outlier: outliers) s.insert(outlier);
+        outliers.assign(s.begin(), s.end());
 
-        EventPair* calc = deviceTimer.add("Kernel");
 
-        unsigned int offset = currentStart * args.slideSize;
-        unsigned int currentEnd = offset + currentSize;
-        unsigned int sharedMem = 2 * args.chunkSize * dataset->dimensions * sizeof(T);
+        fmt::print(
+                "┌{0:─^{1}}┐\n"
+                "│{3: ^{2}}|{4: ^{2}}│\n"
+                "│{5: ^{2}}|{6: ^{2}}│\n"
+                "│{7: ^{2}}|{8: ^{2}}│\n"
+                "│{9: ^{2}}|{10: ^{2}}│\n"
+                "└{11:─^{1}}┘\n", "Query", 51, 25,
+                "Window size (w)", args.windowSize,
+                "Slide size (s)", args.slideSize,
+                "Min. neighbors (k)", args.k,
+                "Threshold", t,
+                ""
+        );
 
-        if (currentEnd > args.cardinality) { // last iteration
-            currentSize = currentSize - (currentEnd - args.cardinality);
+        fmt::print("┌{0:─^{1}}┐\n"
+                   "│{3: ^{2}}|{4: ^{2}}│\n"
+                   "└{5:─^{1}}┘\n", "Result", 51, 25,
+                   "Total outliers", outliers.size(), ""
+        );
+
+        if (!groundTruth.empty()) {
+            std::vector<unsigned int>::iterator it;
+            std::vector<unsigned int> v(std::min(groundTruth.size(), outliers.size()));
+            it = std::set_intersection(groundTruth.begin(), groundTruth.end(), outliers.begin(), outliers.end(),
+                                       v.begin());
+            v.resize(it - v.begin());
+            unsigned int TP = v.size();
+            unsigned int FP = outliers.size() - TP;
+            unsigned int FN = groundTruth.size() - TP;
+            double precision = ((double) TP / (double) (TP + FP)) * 100.0;
+            double recall = ((double) TP / (double) (TP + FN)) * 100.0;
+
+            fmt::print(
+                    "┌{0:─^{1}}┐\n"
+                    "│{3: ^{2}}|{4: ^{2}}│\n"
+                    "│{5: ^{2}}|{6: ^{2}}│\n"
+                    "│{7: ^{2}}|{8: ^{2}}│\n"
+                    "│{9: ^{2}}|{10: ^{2}.2f}│\n"
+                    "│{11: ^{2}}|{12: ^{2}.2f}│\n"
+                    "└{13:─^{1}}┘\n", "Evaluation", 51, 25,
+                    "TP", TP,
+                    "FP", FP,
+                    "FN", FN,
+                    "Precision", precision,
+                    "Recall", recall,
+                    ""
+            );
         }
 
-        if (args.hasWeights) {
-            computeEuclideanParallel<T, true><<<currentSize / args.chunkSize, args.dimensions, sharedMem>>>(
-                    devicePointsRow,
-                    devicePointsCol,
-                    deviceWeights,
-                    dataset->cardinality,
-                    dataset->dimensions,
-                    args.chunkSize,
-                    offset,
-                    currentSize,
-                    args.threshold,
-                    deviceNeighbors);
-        } else {
-            computeEuclideanParallel<T, false><<<currentSize / args.chunkSize, args.dimensions, sharedMem>>>(
-                    devicePointsRow,
-                    devicePointsCol,
-                    deviceWeights,
-                    dataset->cardinality,
-                    dataset->dimensions,
-                    args.chunkSize,
-                    offset,
-                    currentSize,
-                    args.threshold,
-                    deviceNeighbors);
+
+        if (!args.output.empty()) {
+            fmt::print("Writing outliers to {}\n",
+                       std::string("outliers_").append(std::to_string(t)).append("_").append(args.output));
+            writeOutliersResult(outliers,
+                                std::string("outliers_").append(std::to_string(t)).append("_").append(args.output));
+
+            fmt::print("Writing counts to {}\n",
+                       std::string("counts_").append(std::to_string(t)).append("_").append(args.output));
+            writeCountsResult(counts, std::string("counts_").append(std::to_string(t)).append("_").append(args.output));
         }
-
-        DeviceTimer::finish(calc);
-
-        EventPair* extractResults = deviceTimer.add("Extract results");
-        unsigned int deviceRes = thrust::transform_reduce(thrust::device, deviceNeighbors,
-                                                          deviceNeighbors + currentSize, filter(args.k), 0,
-                                                          thrust::plus<unsigned int>());
-
-        thrust::copy_if(thrust::make_counting_iterator<unsigned int>((currentStart * args.slideSize) + 1),
-                        thrust::make_counting_iterator<unsigned int>((currentStart * args.slideSize) + currentSize + 1),
-                        thrust::device_ptr<unsigned int>(deviceNeighbors),
-                        thrust::device_ptr<unsigned int>(deviceOutliers),
-                        filter(args.k));
-
-        std::vector<unsigned int> tmp(deviceRes);
-        errorCheck(cudaMemcpy(&tmp[0], deviceOutliers, sizeof(unsigned int) * deviceRes, cudaMemcpyDeviceToHost))
-        DeviceTimer::finish(extractResults);
-
-        outliers.insert(outliers.end(), tmp.begin(), tmp.end());
-        counts.push_back(deviceRes);
     }
+
+    cudaDeviceSynchronize();
+
 
     EventPair* freeDevMem = deviceTimer.add("Free device memory");
     errorCheck(cudaFree(devicePointsRow))
@@ -335,18 +416,6 @@ void processDataset(Dataset<T>* dataset, const Args& args) {
     errorCheck(cudaFree(deviceNeighbors))
     DeviceTimer::finish(freeDevMem);
 
-    cudaDeviceSynchronize();
+
     deviceTimer.print();
-
-    fmt::print("┌{0:─^{1}}┐\n"
-               "│{3: ^{2}}|{4: ^{2}}│\n"
-               "└{5:─^{1}}┘\n", "Result", 51, 25,
-               "Total outliers", outliers.size(), ""
-    );
-
-    fmt::print("Writing outliers to {}\n", std::string("outliers_").append(args.output));
-    writeOutliersResult(outliers, std::string("outliers_").append(args.output));
-
-    fmt::print("Writing counts to {}\n", std::string("counts_").append(args.output));
-    writeCountsResult(counts, std::string("counts_").append(args.output));
 }
