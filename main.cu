@@ -25,9 +25,26 @@ struct Args {
     unsigned int windowSize = 10000;
     unsigned int slideSize = 500;
     unsigned int k = 50;
+    bool isFixed = false;
+    unsigned int fixedPoints = 0;
     std::vector<double> threshold;
     unsigned int blocks{};
     unsigned int blockSize{};
+};
+
+template<typename T>
+struct DeviceData {
+    // store dataset in device memory twice, both in row-major and col-major format
+    T* pointsRow;
+    T* pointsCol;
+    T* weights;
+    unsigned int* neighbors;
+    unsigned int* outliers;
+};
+
+struct Result {
+    std::vector<unsigned int> counts;
+    std::vector<unsigned int> outliers;
 };
 
 struct filter {
@@ -41,10 +58,9 @@ struct filter {
 };
 
 template<typename T, bool weighted>
-__global__ void computeEuclideanParallel(const T* pointsRow, const T* pointsCol, const T* weights,
+__global__ void computeEuclideanSlidingWindow(DeviceData<T> data,
                                          unsigned int cardinality, unsigned int dimensions, unsigned int chunkSize,
-                                         unsigned int offset, unsigned int size, double threshold,
-                                         unsigned int* neighbors);
+                                         unsigned int offset, unsigned int size, double threshold);
 
 template<typename T>
 void processDataset(Dataset<T>* dataset, const Args& args, std::set<unsigned int>& groundTruth);
@@ -71,6 +87,7 @@ int main(int argc, char** argv) {
                 // Outlier detection related arguments
                 ("w,window", "Window size (must be multiple of slide, default: 10000)",
                  cxxopts::value<unsigned int>(args.windowSize))
+                ("f,fixed", "First N points are used as distance baseline", cxxopts::value<unsigned int>(args.fixedPoints))
                 ("s,slide", "Slide size (default: 500)", cxxopts::value<unsigned int>(args.slideSize))
                 ("c,cardinality", "Dataset cardinality", cxxopts::value<unsigned int>(args.cardinality))
                 ("d,dimensions", "Point dimensionality", cxxopts::value<unsigned int>(args.dimensions))
@@ -115,8 +132,17 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        if (args.windowSize % args.slideSize != 0) {
+        if (args.fixedPoints > 0) {
+            args.isFixed = true;
+        }
+
+        if (args.windowSize % args.slideSize != 0 && !args.isFixed) {
             fmt::print("{}\n", "Error, window size must be multiple of slide size! Exiting...");
+            return 1;
+        }
+
+        if (args.fixedPoints % args.slideSize != 0 && args.isFixed) {
+            fmt::print("{}\n", "Error, fixed points must be multiple of slide size! Exiting...");
             return 1;
         }
 
@@ -141,8 +167,6 @@ int main(int argc, char** argv) {
                                    groundTruth);
         }
 
-        fmt::print("Finished!\n");
-
     } catch (const cxxopts::OptionException& e) {
         fmt::print("{}\n", e.what());
         return 1;
@@ -160,10 +184,9 @@ __device__ T* shared_memory_proxy() {
 
 
 template<typename T, bool weighted>
-__global__ void computeEuclideanParallel(const T* pointsRow, const T* pointsCol, const T* weights,
+__global__ void computeEuclideanSlidingWindow(DeviceData<T> data,
                                          unsigned int cardinality, unsigned int dimensions, unsigned int chunkSize,
-                                         unsigned int offset, unsigned int size, double threshold,
-                                         unsigned int* neighbors) {
+                                         unsigned int offset, unsigned int size, double threshold) {
     auto smem = shared_memory_proxy<T>();
     T* sharedPoints = smem;
     T* result = (T*) &sharedPoints[chunkSize * dimensions] + threadIdx.x * chunkSize;
@@ -173,34 +196,35 @@ __global__ void computeEuclideanParallel(const T* pointsRow, const T* pointsCol,
     while ((bx * chunkSize) < size) {
         unsigned int tx = threadIdx.x;
         // load points to shared memory
-        for (int i = 0; i < chunkSize; i++)
-            sharedPoints[(i * dimensions) + tx] = pointsRow[(dimensions * offset) +
+        for (int i = 0; i < 6; i++){
+            sharedPoints[(i * dimensions) + tx] = data.pointsRow[(dimensions * offset) +
                                                             (((bx * chunkSize) + i) * dimensions) + tx];
+        }
+
         __syncthreads();
 
         while (tx < size) {
             for (int i = 0; i < chunkSize; i++)
                 result[i] = 0.0f;
             for (int i = 0; i < dimensions; i++) {
-                T tmp = pointsCol[(cardinality * i + offset) + tx];
+                T tmp = data.pointsCol[(cardinality * i + offset) + tx];
                 for (int j = 0; j < chunkSize; j++) {
                     T res = tmp - sharedPoints[i + (j * dimensions)];
                     if (weighted) {
-                        result[j] += (res * res) * weights[i];
+                        result[j] += (res * res) * data.weights[i];
                     } else {
                         result[j] += res * res;
                     }
                 }
             }
             for (int i = 0; i < chunkSize; i++) {
-//                distances[((i + (bx * chunkSize)) * cardinality) + tx] = result[i];
                 if (sqrt(result[i]) <= threshold) {
                     unsigned int tmp = ((i + (bx * chunkSize)) * size) + tx;
                     unsigned int a = (tmp / size);
                     unsigned int b = (tmp % size);
                     if (a < b) {
-                        atomicAdd(neighbors + a, 1);
-                        atomicAdd(neighbors + b, 1);
+                        atomicAdd(data.neighbors + a, 1);
+                        atomicAdd(data.neighbors + b, 1);
                     }
                 }
             }
@@ -212,8 +236,198 @@ __global__ void computeEuclideanParallel(const T* pointsRow, const T* pointsCol,
 }
 
 template<typename T>
+void allocateDeviceMemory(DeviceData<T>& deviceData, Dataset<T>* dataset, const Args& args)
+{
+    errorCheck(cudaMalloc((void**) &(deviceData.pointsRow), sizeof(T) * dataset->cardinality * dataset->dimensions))
+    errorCheck(cudaMalloc((void**) &(deviceData.pointsCol), sizeof(T) * dataset->cardinality * dataset->dimensions))
+    if (args.hasWeights) {
+        errorCheck(cudaMalloc((void**) &(deviceData.weights), sizeof(T) * dataset->dimensions))
+    }
+
+    if (args.isFixed) {
+        errorCheck(cudaMalloc((void**) &(deviceData.neighbors), sizeof(unsigned int) * args.slideSize))
+        errorCheck(cudaMalloc((void**) &(deviceData.outliers), sizeof(unsigned int) * args.slideSize))
+    } else { // sliding window
+        errorCheck(cudaMalloc((void**) &(deviceData.neighbors), sizeof(unsigned int) * args.windowSize))
+        errorCheck(cudaMalloc((void**) &(deviceData.outliers), sizeof(unsigned int) * args.windowSize))
+    }
+}
+template<typename T>
+void transferToDeviceMemory(DeviceData<T>& deviceData, Dataset<T>* dataset, const Args& args)
+{
+    errorCheck(
+            cudaMemcpy(deviceData.pointsRow, dataset->pointsRow, sizeof(T) * dataset->cardinality * dataset->dimensions,
+                       cudaMemcpyHostToDevice))
+    errorCheck(
+            cudaMemcpy(deviceData.pointsCol, dataset->pointsCol, sizeof(T) * dataset->cardinality * dataset->dimensions,
+                       cudaMemcpyHostToDevice))
+    if (args.hasWeights) {
+        errorCheck(cudaMemcpy(deviceData.weights, dataset->weights, sizeof(T) * dataset->dimensions,
+                              cudaMemcpyHostToDevice))
+    }
+}
+
+void clearNeighbors(unsigned int* deviceNeighbors, unsigned int size)
+{
+    errorCheck(cudaMemset(deviceNeighbors, 0, sizeof(unsigned int) * size))
+}
+
+template<typename T>
+void freeDeviceMemory(DeviceData<T>& deviceData)
+{
+    errorCheck(cudaFree(deviceData.pointsRow))
+    errorCheck(cudaFree(deviceData.pointsCol))
+    errorCheck(cudaFree(deviceData.neighbors))
+    errorCheck(cudaFree(deviceData.outliers))
+}
+
+template<typename T>
+std::vector<unsigned int> extractResults(DeviceData<T>& deviceData, const Args& args, unsigned int start, unsigned int size)
+{
+    unsigned int deviceRes = thrust::transform_reduce(thrust::device, deviceData.neighbors,
+                                                      deviceData.neighbors + size, filter(args.k), 0,
+                                                      thrust::plus<unsigned int>());
+
+    thrust::copy_if(thrust::make_counting_iterator<unsigned int>((start * args.slideSize) + 1),
+                    thrust::make_counting_iterator<unsigned int>(
+                            (start * args.slideSize) + size + 1),
+                    thrust::device_ptr<unsigned int>(deviceData.neighbors),
+                    thrust::device_ptr<unsigned int>(deviceData.outliers),
+                    filter(args.k));
+
+    std::vector<unsigned int> tmp(deviceRes);
+    errorCheck(cudaMemcpy(&tmp[0], deviceData.outliers, sizeof(unsigned int) * deviceRes, cudaMemcpyDeviceToHost))
+    return tmp;
+}
+
+template<typename T>
+Result executeFixed(Dataset<T>* dataset, DeviceData<T>& deviceData, const Args& args, DeviceTimer& deviceTimer)
+{
+    Result result;
+    unsigned int remainingPoints = args.cardinality - args.fixedPoints;
+    unsigned int numOfIterations = (remainingPoints / args.slideSize) + (remainingPoints % args.slideSize != 0 ? 1 : 0);
+
+    for (unsigned int i = 0; i < numOfIterations; ++i) {
+        //TODO
+    }
+
+    return result;
+}
+
+
+template<typename T>
+Result executeSlidingWindow(Dataset<T>* dataset, DeviceData<T>& deviceData, const Args& args, DeviceTimer& deviceTimer, double threshold)
+{
+    unsigned int currentSize = 0;
+    unsigned int currentStart = 0;
+
+    Result result;
+    unsigned int numOfIterations = (args.cardinality / args.slideSize) + (args.cardinality % args.slideSize != 0 ? 1 : 0);
+
+    for (unsigned int i = 0; i < numOfIterations; ++i) {
+
+        if (currentSize < args.windowSize) {
+            currentSize += args.slideSize;
+        } else {
+            currentStart++;
+        }
+
+        EventPair* clearMem = deviceTimer.add("Clear neighbors");
+        clearNeighbors(deviceData.neighbors, currentSize);
+        DeviceTimer::finish(clearMem);
+
+        EventPair* calc = deviceTimer.add("Kernel");
+
+        unsigned int offset = currentStart * args.slideSize;
+        unsigned int currentEnd = offset + currentSize;
+        unsigned int sharedMem = 2 * args.chunkSize * dataset->dimensions * sizeof(T);
+
+        if (currentEnd > args.cardinality) { // last iteration
+            currentSize = currentSize - (currentEnd - args.cardinality);
+        }
+
+        if (args.hasWeights) {
+            computeEuclideanSlidingWindow<T, true><<<currentSize / args.chunkSize, args.dimensions, sharedMem>>>(
+                    deviceData,
+                    dataset->cardinality,
+                    dataset->dimensions,
+                    args.chunkSize,
+                    offset,
+                    currentSize,
+                    threshold);
+        } else {
+            computeEuclideanSlidingWindow<T, false><<<currentSize / args.chunkSize, args.dimensions, sharedMem>>>(
+                    deviceData,
+                    dataset->cardinality,
+                    dataset->dimensions,
+                    args.chunkSize,
+                    offset,
+                    currentSize,
+                    threshold);
+        }
+        DeviceTimer::finish(calc);
+
+        EventPair* extractRes = deviceTimer.add("Extract results");
+        std::vector<unsigned int> tmp = extractResults<T>(deviceData, args, currentStart, currentSize);
+        DeviceTimer::finish(extractRes);
+
+        result.outliers.insert(result.outliers.end(), tmp.begin(), tmp.end());
+        result.counts.push_back(tmp.size());
+    }
+
+    std::set<unsigned int> s;
+    for (unsigned int& outlier : result.outliers) s.insert(outlier);
+    result.outliers.assign(s.begin(), s.end());
+
+    return result;
+}
+
+void calculateScore(Result& result, std::set<unsigned int>& groundTruth)
+{
+    std::vector<unsigned int>::iterator it;
+    std::vector<unsigned int> v(std::min(groundTruth.size(), result.outliers.size()));
+    it = std::set_intersection(groundTruth.begin(), groundTruth.end(), result.outliers.begin(), result.outliers.end(),
+                               v.begin());
+    v.resize(it - v.begin());
+    unsigned int TP = v.size();
+    unsigned int FP = result.outliers.size() - TP;
+    unsigned int FN = groundTruth.size() - TP;
+    double precision = ((double) TP / (double) (TP + FP)) * 100.0;
+    double recall = ((double) TP / (double) (TP + FN)) * 100.0;
+
+    fmt::print(
+            "┌{0:─^{1}}┐\n"
+            "│{3: ^{2}}|{4: ^{2}}│\n"
+            "│{5: ^{2}}|{6: ^{2}}│\n"
+            "│{7: ^{2}}|{8: ^{2}}│\n"
+            "│{9: ^{2}}|{10: ^{2}.2f}│\n"
+            "│{11: ^{2}}|{12: ^{2}.2f}│\n"
+            "└{13:─^{1}}┘\n", "Evaluation", 51, 25,
+            "TP", TP,
+            "FP", FP,
+            "FN", FN,
+            "Precision", precision,
+            "Recall", recall,
+            ""
+    );
+}
+
+void writeOutput(const std::string& output, double threshold, Result& result)
+{
+    fmt::print("Writing outliers to {}\n",
+               std::string("outliers_").append(std::to_string(threshold)).append("_").append(output));
+    writeOutliersResult(result.outliers,
+                        std::string("outliers_").append(std::to_string(threshold)).append("_").append(output));
+
+    fmt::print("Writing counts to {}\n",
+               std::string("counts_").append(std::to_string(threshold)).append("_").append(output));
+    writeCountsResult(result.counts, std::string("counts_").append(std::to_string(threshold)).append("_").append(output));
+}
+
+template<typename T>
 void processDataset(Dataset<T>* dataset, const Args& args, std::set<unsigned int>& groundTruth) {
 
+    // print dataset information
     fmt::print(
             "┌{0:─^{1}}┐\n"
             "│{3: ^{2}}|{4: ^{2}}│\n"
@@ -226,194 +440,83 @@ void processDataset(Dataset<T>* dataset, const Args& args, std::set<unsigned int
     );
 
     DeviceTimer deviceTimer;
-
-    T* devicePointsRow;
-    T* devicePointsCol;
-    T* deviceWeights;
-    unsigned int* deviceNeighbors;
-    unsigned int* deviceOutliers;
+    DeviceData<T> deviceData{};
 
     EventPair* devMemAlloc = deviceTimer.add("Device memory allocation");
-    errorCheck(cudaMalloc((void**) &devicePointsRow, sizeof(T) * dataset->cardinality * dataset->dimensions))
-    errorCheck(cudaMalloc((void**) &devicePointsCol, sizeof(T) * dataset->cardinality * dataset->dimensions))
-    if (args.hasWeights) {
-        errorCheck(cudaMalloc((void**) &deviceWeights, sizeof(T) * dataset->dimensions))
-    }
-    errorCheck(cudaMalloc((void**) &deviceNeighbors, sizeof(unsigned int) * args.windowSize))
-    errorCheck(cudaMalloc((void**) &deviceOutliers, sizeof(unsigned int) * args.windowSize))
+    allocateDeviceMemory<T>(deviceData, dataset, args);
     DeviceTimer::finish(devMemAlloc);
 
     EventPair* dataTransfer = deviceTimer.add("Transfer to device");
-    errorCheck(
-            cudaMemcpy(devicePointsRow, dataset->pointsRow, sizeof(T) * dataset->cardinality * dataset->dimensions,
-                       cudaMemcpyHostToDevice))
-    errorCheck(
-            cudaMemcpy(devicePointsCol, dataset->pointsCol, sizeof(T) * dataset->cardinality * dataset->dimensions,
-                       cudaMemcpyHostToDevice))
-    if (args.hasWeights) {
-        errorCheck(cudaMemcpy(deviceWeights, dataset->weights, sizeof(T) * dataset->dimensions,
-                              cudaMemcpyHostToDevice))
-    }
+    transferToDeviceMemory<T>(deviceData, dataset, args);
     DeviceTimer::finish(dataTransfer);
 
-    cudaFuncSetCacheConfig(computeEuclideanParallel<float, true>, cudaFuncCachePreferL1);
-    cudaFuncSetCacheConfig(computeEuclideanParallel<float, false>, cudaFuncCachePreferL1);
+    cudaFuncSetCacheConfig(computeEuclideanSlidingWindow<float, true>, cudaFuncCachePreferL1);
+    cudaFuncSetCacheConfig(computeEuclideanSlidingWindow<float, false>, cudaFuncCachePreferL1);
 
-    cudaFuncSetCacheConfig(computeEuclideanParallel<double, true>, cudaFuncCachePreferL1);
-    cudaFuncSetCacheConfig(computeEuclideanParallel<double, false>, cudaFuncCachePreferL1);
+    cudaFuncSetCacheConfig(computeEuclideanSlidingWindow<double, true>, cudaFuncCachePreferL1);
+    cudaFuncSetCacheConfig(computeEuclideanSlidingWindow<double, false>, cudaFuncCachePreferL1);
+
 
     for (auto& t: args.threshold) {
-        unsigned int currentSize = 0;
-        unsigned int currentStart = 0;
-
-        std::vector<unsigned int> counts;
-        std::vector<unsigned int> outliers;
-
-        for (unsigned int i = 0;
-             i < (args.cardinality / args.slideSize) + (args.cardinality % args.slideSize != 0 ? 1 : 0); ++i) {
-
-            if (currentSize < args.windowSize) {
-                currentSize += args.slideSize;
-            } else {
-                currentStart++;
-            }
-
-            EventPair* clearMem = deviceTimer.add("Clear neighbors");
-            errorCheck(cudaMemset(deviceNeighbors, 0, sizeof(unsigned int) * currentSize))
-            DeviceTimer::finish(clearMem);
-
-            EventPair* calc = deviceTimer.add("Kernel");
-
-            unsigned int offset = currentStart * args.slideSize;
-            unsigned int currentEnd = offset + currentSize;
-            unsigned int sharedMem = 2 * args.chunkSize * dataset->dimensions * sizeof(T);
-
-            if (currentEnd > args.cardinality) { // last iteration
-                currentSize = currentSize - (currentEnd - args.cardinality);
-            }
-
-            if (args.hasWeights) {
-                computeEuclideanParallel<T, true><<<currentSize / args.chunkSize, args.dimensions, sharedMem>>>(
-                        devicePointsRow,
-                        devicePointsCol,
-                        deviceWeights,
-                        dataset->cardinality,
-                        dataset->dimensions,
-                        args.chunkSize,
-                        offset,
-                        currentSize,
-                        t,
-                        deviceNeighbors);
-            } else {
-                computeEuclideanParallel<T, false><<<currentSize / args.chunkSize, args.dimensions, sharedMem>>>(
-                        devicePointsRow,
-                        devicePointsCol,
-                        deviceWeights,
-                        dataset->cardinality,
-                        dataset->dimensions,
-                        args.chunkSize,
-                        offset,
-                        currentSize,
-                        t,
-                        deviceNeighbors);
-            }
-
-            DeviceTimer::finish(calc);
-
-            EventPair* extractResults = deviceTimer.add("Extract results");
-            unsigned int deviceRes = thrust::transform_reduce(thrust::device, deviceNeighbors,
-                                                              deviceNeighbors + currentSize, filter(args.k), 0,
-                                                              thrust::plus<unsigned int>());
-
-            thrust::copy_if(thrust::make_counting_iterator<unsigned int>((currentStart * args.slideSize) + 1),
-                            thrust::make_counting_iterator<unsigned int>(
-                                    (currentStart * args.slideSize) + currentSize + 1),
-                            thrust::device_ptr<unsigned int>(deviceNeighbors),
-                            thrust::device_ptr<unsigned int>(deviceOutliers),
-                            filter(args.k));
-
-            std::vector<unsigned int> tmp(deviceRes);
-            errorCheck(cudaMemcpy(&tmp[0], deviceOutliers, sizeof(unsigned int) * deviceRes, cudaMemcpyDeviceToHost))
-            DeviceTimer::finish(extractResults);
-
-            outliers.insert(outliers.end(), tmp.begin(), tmp.end());
-            counts.push_back(deviceRes);
-        }
-
-        std::set<unsigned int> s;
-        for (unsigned int& outlier: outliers) s.insert(outlier);
-        outliers.assign(s.begin(), s.end());
-
-
-        fmt::print(
-                "┌{0:─^{1}}┐\n"
-                "│{3: ^{2}}|{4: ^{2}}│\n"
-                "│{5: ^{2}}|{6: ^{2}}│\n"
-                "│{7: ^{2}}|{8: ^{2}}│\n"
-                "│{9: ^{2}}|{10: ^{2}}│\n"
-                "└{11:─^{1}}┘\n", "Query", 51, 25,
-                "Window size (w)", args.windowSize,
-                "Slide size (s)", args.slideSize,
-                "Min. neighbors (k)", args.k,
-                "Threshold", t,
-                ""
-        );
-
-        fmt::print("┌{0:─^{1}}┐\n"
-                   "│{3: ^{2}}|{4: ^{2}}│\n"
-                   "└{5:─^{1}}┘\n", "Result", 51, 25,
-                   "Total outliers", outliers.size(), ""
-        );
-
-        if (!groundTruth.empty()) {
-            std::vector<unsigned int>::iterator it;
-            std::vector<unsigned int> v(std::min(groundTruth.size(), outliers.size()));
-            it = std::set_intersection(groundTruth.begin(), groundTruth.end(), outliers.begin(), outliers.end(),
-                                       v.begin());
-            v.resize(it - v.begin());
-            unsigned int TP = v.size();
-            unsigned int FP = outliers.size() - TP;
-            unsigned int FN = groundTruth.size() - TP;
-            double precision = ((double) TP / (double) (TP + FP)) * 100.0;
-            double recall = ((double) TP / (double) (TP + FN)) * 100.0;
-
+        Result result;
+        if (args.isFixed) {
             fmt::print(
                     "┌{0:─^{1}}┐\n"
                     "│{3: ^{2}}|{4: ^{2}}│\n"
                     "│{5: ^{2}}|{6: ^{2}}│\n"
                     "│{7: ^{2}}|{8: ^{2}}│\n"
-                    "│{9: ^{2}}|{10: ^{2}.2f}│\n"
-                    "│{11: ^{2}}|{12: ^{2}.2f}│\n"
-                    "└{13:─^{1}}┘\n", "Evaluation", 51, 25,
-                    "TP", TP,
-                    "FP", FP,
-                    "FN", FN,
-                    "Precision", precision,
-                    "Recall", recall,
+                    "│{9: ^{2}}|{10: ^{2}}│\n"
+                    "│{11: ^{2}}|{12: ^{2}}│\n"
+                    "└{13:─^{1}}┘\n", "Query", 51, 25,
+                    "Type", "Fixed",
+                    "Fixed points (f)", args.fixedPoints,
+                    "Slide size (s)", args.slideSize,
+                    "Min. neighbors (k)", args.k,
+                    "Threshold", t,
                     ""
             );
+            result = executeFixed(dataset, deviceData, args, deviceTimer);
+        } else { // sliding window
+            fmt::print(
+                    "┌{0:─^{1}}┐\n"
+                    "│{3: ^{2}}|{4: ^{2}}│\n"
+                    "│{5: ^{2}}|{6: ^{2}}│\n"
+                    "│{7: ^{2}}|{8: ^{2}}│\n"
+                    "│{9: ^{2}}|{10: ^{2}}│\n"
+                    "│{11: ^{2}}|{12: ^{2}}│\n"
+                    "└{13:─^{1}}┘\n", "Query", 51, 25,
+                    "Type", "Sliding window",
+                    "Window size (w)", args.windowSize,
+                    "Slide size (s)", args.slideSize,
+                    "Min. neighbors (k)", args.k,
+                    "Threshold", t,
+                    ""
+            );
+            result = executeSlidingWindow<T>(dataset, deviceData, args, deviceTimer, t);
+        }
+
+        if (!groundTruth.empty()) {
+            calculateScore(result, groundTruth);
         }
 
 
         if (!args.output.empty()) {
-            fmt::print("Writing outliers to {}\n",
-                       std::string("outliers_").append(std::to_string(t)).append("_").append(args.output));
-            writeOutliersResult(outliers,
-                                std::string("outliers_").append(std::to_string(t)).append("_").append(args.output));
-
-            fmt::print("Writing counts to {}\n",
-                       std::string("counts_").append(std::to_string(t)).append("_").append(args.output));
-            writeCountsResult(counts, std::string("counts_").append(std::to_string(t)).append("_").append(args.output));
+            writeOutput(args.output, t, result);
         }
+
+
+        fmt::print("┌{0:─^{1}}┐\n"
+                   "│{3: ^{2}}|{4: ^{2}}│\n"
+                   "└{5:─^{1}}┘\n", "Result", 51, 25,
+                   "Total outliers", result.outliers.size(), ""
+        );
     }
 
-    cudaDeviceSynchronize();
+    errorCheck(cudaDeviceSynchronize())
 
 
     EventPair* freeDevMem = deviceTimer.add("Free device memory");
-    errorCheck(cudaFree(devicePointsRow))
-    errorCheck(cudaFree(devicePointsCol))
-    errorCheck(cudaFree(deviceNeighbors))
+    freeDeviceMemory(deviceData);
     DeviceTimer::finish(freeDevMem);
 
 
