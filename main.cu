@@ -61,6 +61,10 @@ template<typename T, bool weighted>
 __global__ void computeEuclideanSlidingWindow(DeviceData<T> data,
                                          unsigned int cardinality, unsigned int dimensions, unsigned int chunkSize,
                                          unsigned int offset, unsigned int size, double threshold);
+template<typename T, bool weighted>
+__global__ void computeEuclideanFixed(DeviceData<T> data,
+                                         unsigned int cardinality, unsigned int dimensions, unsigned int chunkSize,
+                                         unsigned int fixedPoints, unsigned int offset, unsigned int size, double threshold);
 
 template<typename T>
 void processDataset(Dataset<T>* dataset, const Args& args, std::set<unsigned int>& groundTruth);
@@ -98,7 +102,7 @@ int main(int argc, char** argv) {
                 ("ground-truth", "Ground truth file (the outlier ids)",
                  cxxopts::value<std::string>(args.groundTruthFile))
                 // GPU related arguments
-                ("chunk", "Chunk size (points assigned per blocked)", cxxopts::value<unsigned int>(args.chunkSize))
+                ("chunk", "Chunk size (points assigned per block)", cxxopts::value<unsigned int>(args.chunkSize))
                 ("blocks", "Number of blocks (default: " + std::to_string(args.blocks) + ")",
                  cxxopts::value<unsigned int>(args.blocks))
                 ("threads", "Threads per block (default: " + std::to_string(args.blockSize) + ")",
@@ -150,7 +154,6 @@ int main(int argc, char** argv) {
             args.hasWeights = true;
         }
 
-
         std::set<unsigned int> groundTruth;
 
         if (result.count("ground-truth")) {
@@ -196,9 +199,12 @@ __global__ void computeEuclideanSlidingWindow(DeviceData<T> data,
     while ((bx * chunkSize) < size) {
         unsigned int tx = threadIdx.x;
         // load points to shared memory
-        for (int i = 0; i < 6; i++){
+        // each thread is responsible to store a specific dimension to shared memory
+        for (int i = 0; i < chunkSize; i++){
             sharedPoints[(i * dimensions) + tx] = data.pointsRow[(dimensions * offset) +
                                                             (((bx * chunkSize) + i) * dimensions) + tx];
+            printf("%d\n", (bx * chunkSize) + i);
+//            printf("%.2f\n", sharedPoints[(i * dimensions) + tx]);
         }
 
         __syncthreads();
@@ -235,6 +241,63 @@ __global__ void computeEuclideanSlidingWindow(DeviceData<T> data,
     }
 }
 
+template<typename T, bool weighted>
+__global__ void computeEuclideanFixed(DeviceData<T> data,
+                                         unsigned int cardinality, unsigned int dimensions, unsigned int chunkSize,
+                                         unsigned int fixedPoints, unsigned int offset, unsigned int size, double threshold) {
+    auto smem = shared_memory_proxy<T>();
+    T* sharedPoints = smem;
+    T* result = (T*) &sharedPoints[chunkSize * dimensions] + threadIdx.x * chunkSize;
+
+    unsigned int bx = blockIdx.x;
+
+    while ((bx * chunkSize) < size) {
+        unsigned int tx = threadIdx.x;
+        // load points to shared memory
+        for (int i = 0; i < chunkSize; i++){
+            if ((bx * chunkSize) + i < fixedPoints) { // then load fixed points to shared memory
+                sharedPoints[(i * dimensions) + tx] = data.pointsRow[(((bx * chunkSize) + i) * dimensions) + tx];
+            } else { // load slide points to shared memory
+                sharedPoints[(i * dimensions) + tx] = data.pointsRow[(dimensions * offset) +
+                                                                     (((bx * chunkSize) + i - fixedPoints) * dimensions) + tx];
+            }
+            printf("%d %2.f\n", (bx * chunkSize) + i, sharedPoints[(i * dimensions) + tx]);
+        }
+
+        __syncthreads();
+
+//        while (tx < size) {
+//            for (int i = 0; i < chunkSize; i++)
+//                result[i] = 0.0f;
+//            for (int i = 0; i < dimensions; i++) {
+//                T tmp = data.pointsCol[(cardinality * i + offset) + tx];
+//                for (int j = 0; j < chunkSize; j++) {
+//                    T res = tmp - sharedPoints[i + (j * dimensions)];
+//                    if (weighted) {
+//                        result[j] += (res * res) * data.weights[i];
+//                    } else {
+//                        result[j] += res * res;
+//                    }
+//                }
+//            }
+//            for (int i = 0; i < chunkSize; i++) {
+//                if (sqrt(result[i]) <= threshold) {
+//                    unsigned int tmp = ((i + (bx * chunkSize)) * size) + tx;
+//                    unsigned int a = (tmp / size);
+//                    unsigned int b = (tmp % size);
+//                    if (a < b) {
+//                        atomicAdd(data.neighbors + a, 1);
+//                        atomicAdd(data.neighbors + b, 1);
+//                    }
+//                }
+//            }
+//            tx += blockDim.x;
+//        }
+        __syncthreads();
+        bx += gridDim.x;
+    }
+}
+
 template<typename T>
 void allocateDeviceMemory(DeviceData<T>& deviceData, Dataset<T>* dataset, const Args& args)
 {
@@ -253,6 +316,7 @@ void allocateDeviceMemory(DeviceData<T>& deviceData, Dataset<T>* dataset, const 
     }
 }
 template<typename T>
+
 void transferToDeviceMemory(DeviceData<T>& deviceData, Dataset<T>* dataset, const Args& args)
 {
     errorCheck(
@@ -301,14 +365,52 @@ std::vector<unsigned int> extractResults(DeviceData<T>& deviceData, const Args& 
 }
 
 template<typename T>
-Result executeFixed(Dataset<T>* dataset, DeviceData<T>& deviceData, const Args& args, DeviceTimer& deviceTimer)
+Result executeFixed(Dataset<T>* dataset, DeviceData<T>& deviceData, const Args& args, DeviceTimer& deviceTimer, double threshold)
 {
+    unsigned int currentStart = args.fixedPoints;
+    unsigned int size = args.fixedPoints + args.slideSize;
+
     Result result;
     unsigned int remainingPoints = args.cardinality - args.fixedPoints;
     unsigned int numOfIterations = (remainingPoints / args.slideSize) + (remainingPoints % args.slideSize != 0 ? 1 : 0);
 
+
     for (unsigned int i = 0; i < numOfIterations; ++i) {
-        //TODO
+
+
+        EventPair* clearMem = deviceTimer.add("Clear neighbors");
+        clearNeighbors(deviceData.neighbors, args.slideSize);
+        DeviceTimer::finish(clearMem);
+
+        EventPair* calc = deviceTimer.add("Kernel");
+
+        unsigned int currentEnd = currentStart + args.slideSize;
+        unsigned int sharedMem = 2 * std::min(args.chunkSize, args.slideSize) * dataset->dimensions * sizeof(T);
+
+        if (currentEnd > args.cardinality) { // last iteration
+            size = size - (currentEnd - args.cardinality);
+        }
+
+
+
+        if (args.hasWeights) {
+
+        } else {
+            fmt::print("{} - {} | {}\n", currentStart, currentEnd, size);
+            fmt::print("Blocks: {}, Threads per block: {}\n", std::max(args.chunkSize, size) / args.chunkSize, args.dimensions);
+            computeEuclideanFixed<T, false><<<std::max(args.chunkSize, size) / args.chunkSize, args.dimensions, sharedMem>>>(
+                    deviceData,
+                    dataset->cardinality,
+                    dataset->dimensions,
+                    std::min(args.chunkSize, size),
+                    args.fixedPoints,
+                    currentStart,
+                    size,
+                    threshold);
+            cudaDeviceSynchronize();
+        }
+        currentStart += args.slideSize;
+        DeviceTimer::finish(calc);
     }
 
     return result;
@@ -340,27 +442,29 @@ Result executeSlidingWindow(Dataset<T>* dataset, DeviceData<T>& deviceData, cons
 
         unsigned int offset = currentStart * args.slideSize;
         unsigned int currentEnd = offset + currentSize;
-        unsigned int sharedMem = 2 * args.chunkSize * dataset->dimensions * sizeof(T);
+        unsigned int sharedMem = 2 * std::min(args.chunkSize, args.slideSize) * dataset->dimensions * sizeof(T);
 
         if (currentEnd > args.cardinality) { // last iteration
             currentSize = currentSize - (currentEnd - args.cardinality);
         }
 
         if (args.hasWeights) {
-            computeEuclideanSlidingWindow<T, true><<<currentSize / args.chunkSize, args.dimensions, sharedMem>>>(
+            computeEuclideanSlidingWindow<T, true><<< std::max(currentSize, args.chunkSize) / args.chunkSize, args.dimensions, sharedMem>>>(
                     deviceData,
                     dataset->cardinality,
                     dataset->dimensions,
-                    args.chunkSize,
+                    std::min(args.chunkSize, currentSize),
                     offset,
                     currentSize,
                     threshold);
         } else {
-            computeEuclideanSlidingWindow<T, false><<<currentSize / args.chunkSize, args.dimensions, sharedMem>>>(
+            fmt::print("{} - {} | {}\n", offset, currentEnd, currentSize);
+            fmt::print("Blocks: {}, Threads per block: {}\n", std::max(currentSize, args.chunkSize) / args.chunkSize, args.dimensions);
+            computeEuclideanSlidingWindow<T, false><<<std::max(currentSize, args.chunkSize) / args.chunkSize, args.dimensions, sharedMem>>>(
                     deviceData,
                     dataset->cardinality,
                     dataset->dimensions,
-                    args.chunkSize,
+                    std::min(args.chunkSize, currentSize),
                     offset,
                     currentSize,
                     threshold);
@@ -456,6 +560,11 @@ void processDataset(Dataset<T>* dataset, const Args& args, std::set<unsigned int
     cudaFuncSetCacheConfig(computeEuclideanSlidingWindow<double, true>, cudaFuncCachePreferL1);
     cudaFuncSetCacheConfig(computeEuclideanSlidingWindow<double, false>, cudaFuncCachePreferL1);
 
+    cudaFuncSetCacheConfig(computeEuclideanFixed<float, true>, cudaFuncCachePreferL1);
+    cudaFuncSetCacheConfig(computeEuclideanFixed<float, false>, cudaFuncCachePreferL1);
+
+    cudaFuncSetCacheConfig(computeEuclideanFixed<double, true>, cudaFuncCachePreferL1);
+    cudaFuncSetCacheConfig(computeEuclideanFixed<double, false>, cudaFuncCachePreferL1);
 
     for (auto& t: args.threshold) {
         Result result;
@@ -475,7 +584,7 @@ void processDataset(Dataset<T>* dataset, const Args& args, std::set<unsigned int
                     "Threshold", t,
                     ""
             );
-            result = executeFixed(dataset, deviceData, args, deviceTimer);
+            result = executeFixed<T>(dataset, deviceData, args, deviceTimer, t);
         } else { // sliding window
             fmt::print(
                     "┌{0:─^{1}}┐\n"
