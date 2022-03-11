@@ -78,9 +78,6 @@ int main(int argc, char** argv) {
         cudaDeviceGetAttribute(&args.multiprocessorCount, cudaDevAttrMultiProcessorCount, 0);
         cudaDeviceGetAttribute(&args.maxThreadsPerBlock, cudaDevAttrMaxThreadsPerBlock, 0);
 
-        args.blocks = args.multiprocessorCount * 16;
-        args.blockSize = args.maxThreadsPerBlock / 2;
-
         cxxopts::Options options(argv[0], "Help");
 
         options.add_options()
@@ -103,10 +100,6 @@ int main(int argc, char** argv) {
                  cxxopts::value<std::string>(args.groundTruthFile))
                 // GPU related arguments
                 ("chunk", "Chunk size (points assigned per block)", cxxopts::value<unsigned int>(args.chunkSize))
-                ("blocks", "Number of blocks (default: " + std::to_string(args.blocks) + ")",
-                 cxxopts::value<unsigned int>(args.blocks))
-                ("threads", "Threads per block (default: " + std::to_string(args.blockSize) + ")",
-                 cxxopts::value<unsigned int>(args.blockSize))
                 ("help", "Print help");
 
         auto result = options.parse(argc, argv);
@@ -203,8 +196,6 @@ __global__ void computeEuclideanSlidingWindow(DeviceData<T> data,
         for (int i = 0; i < chunkSize; i++){
             sharedPoints[(i * dimensions) + tx] = data.pointsRow[(dimensions * offset) +
                                                             (((bx * chunkSize) + i) * dimensions) + tx];
-            printf("%d\n", (bx * chunkSize) + i);
-//            printf("%.2f\n", sharedPoints[(i * dimensions) + tx]);
         }
 
         __syncthreads();
@@ -261,38 +252,42 @@ __global__ void computeEuclideanFixed(DeviceData<T> data,
                 sharedPoints[(i * dimensions) + tx] = data.pointsRow[(dimensions * offset) +
                                                                      (((bx * chunkSize) + i - fixedPoints) * dimensions) + tx];
             }
-            printf("%d %2.f\n", (bx * chunkSize) + i, sharedPoints[(i * dimensions) + tx]);
         }
 
         __syncthreads();
 
-//        while (tx < size) {
-//            for (int i = 0; i < chunkSize; i++)
-//                result[i] = 0.0f;
-//            for (int i = 0; i < dimensions; i++) {
-//                T tmp = data.pointsCol[(cardinality * i + offset) + tx];
-//                for (int j = 0; j < chunkSize; j++) {
-//                    T res = tmp - sharedPoints[i + (j * dimensions)];
-//                    if (weighted) {
-//                        result[j] += (res * res) * data.weights[i];
-//                    } else {
-//                        result[j] += res * res;
-//                    }
-//                }
-//            }
-//            for (int i = 0; i < chunkSize; i++) {
-//                if (sqrt(result[i]) <= threshold) {
-//                    unsigned int tmp = ((i + (bx * chunkSize)) * size) + tx;
-//                    unsigned int a = (tmp / size);
-//                    unsigned int b = (tmp % size);
-//                    if (a < b) {
-//                        atomicAdd(data.neighbors + a, 1);
-//                        atomicAdd(data.neighbors + b, 1);
-//                    }
-//                }
-//            }
-//            tx += blockDim.x;
-//        }
+        while (tx < size) {
+            for (int i = 0; i < chunkSize; i++)
+                result[i] = 0.0f;
+            for (int i = 0; i < dimensions; i++) {
+                T tmp;
+                if (tx < fixedPoints) { // fetch fixed point dimension
+                    tmp = data.pointsCol[(cardinality * i) + tx];
+                } else { // fetch slide point dimension
+                    tmp = data.pointsCol[(cardinality * i + offset) + tx - fixedPoints];
+                }
+                for (int j = 0; j < chunkSize; j++) {
+                    T res = tmp - sharedPoints[i + (j * dimensions)];
+                    if (weighted) {
+                        result[j] += (res * res) * data.weights[i];
+                    } else {
+                        result[j] += res * res;
+                    }
+                }
+            }
+            for (int i = 0; i < chunkSize; i++) {
+                if (sqrt(result[i]) <= threshold) {
+                    unsigned int tmp = ((i + (bx * chunkSize)) * size) + tx;
+                    unsigned int a = (tmp / size);
+                    unsigned int b = (tmp % size);
+                    if (a < b) {
+                        atomicAdd(data.neighbors + a, 1);
+                        atomicAdd(data.neighbors + b, 1);
+                    }
+                }
+            }
+            tx += blockDim.x;
+        }
         __syncthreads();
         bx += gridDim.x;
     }
@@ -308,8 +303,8 @@ void allocateDeviceMemory(DeviceData<T>& deviceData, Dataset<T>* dataset, const 
     }
 
     if (args.isFixed) {
-        errorCheck(cudaMalloc((void**) &(deviceData.neighbors), sizeof(unsigned int) * args.slideSize))
-        errorCheck(cudaMalloc((void**) &(deviceData.outliers), sizeof(unsigned int) * args.slideSize))
+        errorCheck(cudaMalloc((void**) &(deviceData.neighbors), sizeof(unsigned int) * (args.fixedPoints + args.slideSize)))
+        errorCheck(cudaMalloc((void**) &(deviceData.outliers), sizeof(unsigned int) * (args.fixedPoints + args.slideSize)))
     } else { // sliding window
         errorCheck(cudaMalloc((void**) &(deviceData.neighbors), sizeof(unsigned int) * args.windowSize))
         errorCheck(cudaMalloc((void**) &(deviceData.outliers), sizeof(unsigned int) * args.windowSize))
@@ -346,21 +341,26 @@ void freeDeviceMemory(DeviceData<T>& deviceData)
 }
 
 template<typename T>
-std::vector<unsigned int> extractResults(DeviceData<T>& deviceData, const Args& args, unsigned int start, unsigned int size)
+std::vector<unsigned int> extractResults(DeviceData<T>& deviceData, unsigned int startID, unsigned int endID,
+                                         unsigned int offset, unsigned int size, unsigned int k)
 {
-    unsigned int deviceRes = thrust::transform_reduce(thrust::device, deviceData.neighbors,
-                                                      deviceData.neighbors + size, filter(args.k), 0,
+    unsigned int deviceRes = thrust::transform_reduce(thrust::device,
+                                                      thrust::device_ptr<unsigned int>(deviceData.neighbors + offset),
+                                                      thrust::device_ptr<unsigned int>(deviceData.neighbors + size),
+                                                      filter(k),
+                                                      0,
                                                       thrust::plus<unsigned int>());
 
-    thrust::copy_if(thrust::make_counting_iterator<unsigned int>((start * args.slideSize) + 1),
-                    thrust::make_counting_iterator<unsigned int>(
-                            (start * args.slideSize) + size + 1),
-                    thrust::device_ptr<unsigned int>(deviceData.neighbors),
+    thrust::copy_if(thrust::device,
+                    thrust::make_counting_iterator<unsigned int>(startID),
+                    thrust::make_counting_iterator<unsigned int>(endID),
+                    thrust::device_ptr<unsigned int>(deviceData.neighbors + offset),
                     thrust::device_ptr<unsigned int>(deviceData.outliers),
-                    filter(args.k));
+                    filter(k));
 
     std::vector<unsigned int> tmp(deviceRes);
     errorCheck(cudaMemcpy(&tmp[0], deviceData.outliers, sizeof(unsigned int) * deviceRes, cudaMemcpyDeviceToHost))
+
     return tmp;
 }
 
@@ -379,7 +379,7 @@ Result executeFixed(Dataset<T>* dataset, DeviceData<T>& deviceData, const Args& 
 
 
         EventPair* clearMem = deviceTimer.add("Clear neighbors");
-        clearNeighbors(deviceData.neighbors, args.slideSize);
+        clearNeighbors(deviceData.neighbors, size);
         DeviceTimer::finish(clearMem);
 
         EventPair* calc = deviceTimer.add("Kernel");
@@ -391,13 +391,17 @@ Result executeFixed(Dataset<T>* dataset, DeviceData<T>& deviceData, const Args& 
             size = size - (currentEnd - args.cardinality);
         }
 
-
-
         if (args.hasWeights) {
-
+            computeEuclideanFixed<T, true><<<std::max(args.chunkSize, size) / args.chunkSize, args.dimensions, sharedMem>>>(
+                    deviceData,
+                    dataset->cardinality,
+                    dataset->dimensions,
+                    std::min(args.chunkSize, size),
+                    args.fixedPoints,
+                    currentStart,
+                    size,
+                    threshold);
         } else {
-            fmt::print("{} - {} | {}\n", currentStart, currentEnd, size);
-            fmt::print("Blocks: {}, Threads per block: {}\n", std::max(args.chunkSize, size) / args.chunkSize, args.dimensions);
             computeEuclideanFixed<T, false><<<std::max(args.chunkSize, size) / args.chunkSize, args.dimensions, sharedMem>>>(
                     deviceData,
                     dataset->cardinality,
@@ -409,9 +413,22 @@ Result executeFixed(Dataset<T>* dataset, DeviceData<T>& deviceData, const Args& 
                     threshold);
             cudaDeviceSynchronize();
         }
-        currentStart += args.slideSize;
         DeviceTimer::finish(calc);
+
+        EventPair* extractRes = deviceTimer.add("Extract results");
+        std::vector<unsigned int> tmp = extractResults<T>(deviceData, currentStart, currentStart + args.slideSize,
+                                                          args.fixedPoints, size, args.k);
+        DeviceTimer::finish(extractRes);
+
+        result.outliers.insert(result.outliers.end(), tmp.begin(), tmp.end());
+        result.counts.push_back(tmp.size());
+
+        currentStart += args.slideSize;
     }
+
+    std::set<unsigned int> s;
+    for (unsigned int& outlier : result.outliers) s.insert(outlier);
+    result.outliers.assign(s.begin(), s.end());
 
     return result;
 }
@@ -458,8 +475,6 @@ Result executeSlidingWindow(Dataset<T>* dataset, DeviceData<T>& deviceData, cons
                     currentSize,
                     threshold);
         } else {
-            fmt::print("{} - {} | {}\n", offset, currentEnd, currentSize);
-            fmt::print("Blocks: {}, Threads per block: {}\n", std::max(currentSize, args.chunkSize) / args.chunkSize, args.dimensions);
             computeEuclideanSlidingWindow<T, false><<<std::max(currentSize, args.chunkSize) / args.chunkSize, args.dimensions, sharedMem>>>(
                     deviceData,
                     dataset->cardinality,
@@ -472,7 +487,12 @@ Result executeSlidingWindow(Dataset<T>* dataset, DeviceData<T>& deviceData, cons
         DeviceTimer::finish(calc);
 
         EventPair* extractRes = deviceTimer.add("Extract results");
-        std::vector<unsigned int> tmp = extractResults<T>(deviceData, args, currentStart, currentSize);
+        std::vector<unsigned int> tmp = extractResults<T>(deviceData,
+                                                          currentStart * args.slideSize,
+                                                          (currentStart * args.slideSize) + currentSize,
+                                                          0,
+                                                          currentSize,
+                                                          args.k);
         DeviceTimer::finish(extractRes);
 
         result.outliers.insert(result.outliers.end(), tmp.begin(), tmp.end());
