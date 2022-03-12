@@ -538,10 +538,7 @@ void calculateScore(Result& result, std::set<unsigned int>& groundTruth)
 
 void writeOutput(const std::string& output, double radius, unsigned int k, Result& result)
 {
-    fmt::print("Writing outliers to {}.outliers\n", output);
     writeOutliersResult(result.outliers, radius, k, std::string(output).append(".outliers"));
-
-    fmt::print("Writing counts to {}.counts\n", output);
     writeCountsResult(result.counts, radius, k, std::string(output).append(".counts"));
 }
 
@@ -627,6 +624,11 @@ void processDataset(Dataset<T>* dataset, const Args& args, std::set<unsigned int
 
 
         if (!args.output.empty()) {
+            fmt::print(
+                    "┌{0:─^{1}}┐\n"
+                    "│{2: ^{1}}│\n"
+                    "└{0:─^{1}}┘\n", "", 51, "Writing output....");
+
             writeOutput(args.output, r, args.k, result);
         }
 
