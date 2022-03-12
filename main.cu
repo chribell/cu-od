@@ -539,10 +539,10 @@ void calculateScore(Result& result, std::set<unsigned int>& groundTruth)
 void writeOutput(const std::string& output, double radius, unsigned int k, Result& result)
 {
     fmt::print("Writing outliers to {}.outliers\n", output);
-    writeOutliersResult(result.outliers, radius, k, output);
+    writeOutliersResult(result.outliers, radius, k, std::string(output).append(".outliers"));
 
     fmt::print("Writing counts to {}.counts\n", output);
-    writeCountsResult(result.counts, radius, k, output);
+    writeCountsResult(result.counts, radius, k, std::string(output).append(".counts"));
 }
 
 template<typename T>
