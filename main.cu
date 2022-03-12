@@ -27,7 +27,7 @@ struct Args {
     unsigned int k = 50;
     bool isFixed = false;
     unsigned int fixedPoints = 0;
-    std::vector<double> threshold;
+    std::vector<double> radius;
     unsigned int blocks{};
     unsigned int blockSize{};
 };
@@ -60,18 +60,21 @@ struct filter {
 template<typename T, bool weighted>
 __global__ void computeEuclideanSlidingWindow(DeviceData<T> data,
                                          unsigned int cardinality, unsigned int dimensions, unsigned int chunkSize,
-                                         unsigned int offset, unsigned int size, double threshold);
+                                         unsigned int offset, unsigned int size, double radius);
 template<typename T, bool weighted>
 __global__ void computeEuclideanFixed(DeviceData<T> data,
                                          unsigned int cardinality, unsigned int dimensions, unsigned int chunkSize,
-                                         unsigned int fixedPoints, unsigned int offset, unsigned int size, double threshold);
+                                         unsigned int fixedPoints, unsigned int offset, unsigned int size, double radius);
 
 template<typename T>
 void processDataset(Dataset<T>* dataset, const Args& args, std::set<unsigned int>& groundTruth);
 
 int main(int argc, char** argv) {
     try {
-        fmt::print("{}\n", "GPU Naive outlier detection");
+        fmt::print(
+                "┌{0:─^{1}}┐\n"
+                "│{2: ^{1}}│\n"
+                "└{0:─^{1}}┘\n", "", 51, "GPU Naive outlier detection");
 
         Args args;
 
@@ -93,7 +96,7 @@ int main(int argc, char** argv) {
                 ("c,cardinality", "Dataset cardinality", cxxopts::value<unsigned int>(args.cardinality))
                 ("d,dimensions", "Point dimensionality", cxxopts::value<unsigned int>(args.dimensions))
                 ("k", "Minimum number of neighbors to consider a point inlier", cxxopts::value<unsigned int>(args.k))
-                ("t,threshold", "Threshold value (default: 2.0)", cxxopts::value<std::vector<double>>(args.threshold))
+                ("r,radius", "Radius value (default: 2.0)", cxxopts::value<std::vector<double>>(args.radius))
                 ("weights", "Weight file (the number of weights must be equal to the number of dimensions)",
                  cxxopts::value<std::string>(args.weightsFile))
                 ("ground-truth", "Ground truth file (the outlier ids)",
@@ -124,8 +127,8 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        if (args.threshold.empty()) {
-            fmt::print("{}\n", "No thresholds given! Exiting...");
+        if (args.radius.empty()) {
+            fmt::print("{}\n", "No radius given! Exiting...");
             return 1;
         }
 
@@ -182,7 +185,7 @@ __device__ T* shared_memory_proxy() {
 template<typename T, bool weighted>
 __global__ void computeEuclideanSlidingWindow(DeviceData<T> data,
                                          unsigned int cardinality, unsigned int dimensions, unsigned int chunkSize,
-                                         unsigned int offset, unsigned int size, double threshold) {
+                                         unsigned int offset, unsigned int size, double radius) {
     auto smem = shared_memory_proxy<T>();
     T* sharedPoints = smem;
     T* result = (T*) &sharedPoints[chunkSize * dimensions] + threadIdx.x * chunkSize;
@@ -215,7 +218,7 @@ __global__ void computeEuclideanSlidingWindow(DeviceData<T> data,
                 }
             }
             for (int i = 0; i < chunkSize; i++) {
-                if (sqrt(result[i]) <= threshold) {
+                if (sqrt(result[i]) <= radius) {
                     unsigned int tmp = ((i + (bx * chunkSize)) * size) + tx;
                     unsigned int a = (tmp / size);
                     unsigned int b = (tmp % size);
@@ -235,7 +238,7 @@ __global__ void computeEuclideanSlidingWindow(DeviceData<T> data,
 template<typename T, bool weighted>
 __global__ void computeEuclideanFixed(DeviceData<T> data,
                                          unsigned int cardinality, unsigned int dimensions, unsigned int chunkSize,
-                                         unsigned int fixedPoints, unsigned int offset, unsigned int size, double threshold) {
+                                         unsigned int fixedPoints, unsigned int offset, unsigned int size, double radius) {
     auto smem = shared_memory_proxy<T>();
     T* sharedPoints = smem;
     T* result = (T*) &sharedPoints[chunkSize * dimensions] + threadIdx.x * chunkSize;
@@ -276,11 +279,11 @@ __global__ void computeEuclideanFixed(DeviceData<T> data,
                 }
             }
             for (int i = 0; i < chunkSize; i++) {
-                if (sqrt(result[i]) <= threshold) {
+                if (sqrt(result[i]) <= radius) {
                     unsigned int tmp = ((i + (bx * chunkSize)) * size) + tx;
                     unsigned int a = (tmp / size);
                     unsigned int b = (tmp % size);
-                    if (a < b) {
+                    if (a < b && (a < fixedPoints || b < fixedPoints)) {
                         atomicAdd(data.neighbors + a, 1);
                         atomicAdd(data.neighbors + b, 1);
                     }
@@ -365,7 +368,7 @@ std::vector<unsigned int> extractResults(DeviceData<T>& deviceData, unsigned int
 }
 
 template<typename T>
-Result executeFixed(Dataset<T>* dataset, DeviceData<T>& deviceData, const Args& args, DeviceTimer& deviceTimer, double threshold)
+Result executeFixed(Dataset<T>* dataset, DeviceData<T>& deviceData, const Args& args, DeviceTimer& deviceTimer, double radius)
 {
     unsigned int currentStart = args.fixedPoints;
     unsigned int size = args.fixedPoints + args.slideSize;
@@ -374,10 +377,7 @@ Result executeFixed(Dataset<T>* dataset, DeviceData<T>& deviceData, const Args& 
     unsigned int remainingPoints = args.cardinality - args.fixedPoints;
     unsigned int numOfIterations = (remainingPoints / args.slideSize) + (remainingPoints % args.slideSize != 0 ? 1 : 0);
 
-
     for (unsigned int i = 0; i < numOfIterations; ++i) {
-
-
         EventPair* clearMem = deviceTimer.add("Clear neighbors");
         clearNeighbors(deviceData.neighbors, size);
         DeviceTimer::finish(clearMem);
@@ -400,7 +400,7 @@ Result executeFixed(Dataset<T>* dataset, DeviceData<T>& deviceData, const Args& 
                     args.fixedPoints,
                     currentStart,
                     size,
-                    threshold);
+                    radius);
         } else {
             computeEuclideanFixed<T, false><<<std::max(args.chunkSize, size) / args.chunkSize, args.dimensions, sharedMem>>>(
                     deviceData,
@@ -410,7 +410,7 @@ Result executeFixed(Dataset<T>* dataset, DeviceData<T>& deviceData, const Args& 
                     args.fixedPoints,
                     currentStart,
                     size,
-                    threshold);
+                    radius);
             cudaDeviceSynchronize();
         }
         DeviceTimer::finish(calc);
@@ -435,7 +435,7 @@ Result executeFixed(Dataset<T>* dataset, DeviceData<T>& deviceData, const Args& 
 
 
 template<typename T>
-Result executeSlidingWindow(Dataset<T>* dataset, DeviceData<T>& deviceData, const Args& args, DeviceTimer& deviceTimer, double threshold)
+Result executeSlidingWindow(Dataset<T>* dataset, DeviceData<T>& deviceData, const Args& args, DeviceTimer& deviceTimer, double radius)
 {
     unsigned int currentSize = 0;
     unsigned int currentStart = 0;
@@ -473,7 +473,7 @@ Result executeSlidingWindow(Dataset<T>* dataset, DeviceData<T>& deviceData, cons
                     std::min(args.chunkSize, currentSize),
                     offset,
                     currentSize,
-                    threshold);
+                    radius);
         } else {
             computeEuclideanSlidingWindow<T, false><<<std::max(currentSize, args.chunkSize) / args.chunkSize, args.dimensions, sharedMem>>>(
                     deviceData,
@@ -482,7 +482,7 @@ Result executeSlidingWindow(Dataset<T>* dataset, DeviceData<T>& deviceData, cons
                     std::min(args.chunkSize, currentSize),
                     offset,
                     currentSize,
-                    threshold);
+                    radius);
         }
         DeviceTimer::finish(calc);
 
@@ -536,16 +536,13 @@ void calculateScore(Result& result, std::set<unsigned int>& groundTruth)
     );
 }
 
-void writeOutput(const std::string& output, double threshold, Result& result)
+void writeOutput(const std::string& output, double radius, unsigned int k, Result& result)
 {
-    fmt::print("Writing outliers to {}\n",
-               std::string("outliers_").append(std::to_string(threshold)).append("_").append(output));
-    writeOutliersResult(result.outliers,
-                        std::string("outliers_").append(std::to_string(threshold)).append("_").append(output));
+    fmt::print("Writing outliers to {}.outliers\n", output);
+    writeOutliersResult(result.outliers, radius, k, output);
 
-    fmt::print("Writing counts to {}\n",
-               std::string("counts_").append(std::to_string(threshold)).append("_").append(output));
-    writeCountsResult(result.counts, std::string("counts_").append(std::to_string(threshold)).append("_").append(output));
+    fmt::print("Writing counts to {}.counts\n", output);
+    writeCountsResult(result.counts, radius, k, output);
 }
 
 template<typename T>
@@ -586,7 +583,7 @@ void processDataset(Dataset<T>* dataset, const Args& args, std::set<unsigned int
     cudaFuncSetCacheConfig(computeEuclideanFixed<double, true>, cudaFuncCachePreferL1);
     cudaFuncSetCacheConfig(computeEuclideanFixed<double, false>, cudaFuncCachePreferL1);
 
-    for (auto& t: args.threshold) {
+    for (auto& r: args.radius) {
         Result result;
         if (args.isFixed) {
             fmt::print(
@@ -600,11 +597,11 @@ void processDataset(Dataset<T>* dataset, const Args& args, std::set<unsigned int
                     "Type", "Fixed",
                     "Fixed points (f)", args.fixedPoints,
                     "Slide size (s)", args.slideSize,
+                    "Radius (r)", r,
                     "Min. neighbors (k)", args.k,
-                    "Threshold", t,
                     ""
             );
-            result = executeFixed<T>(dataset, deviceData, args, deviceTimer, t);
+            result = executeFixed<T>(dataset, deviceData, args, deviceTimer, r);
         } else { // sliding window
             fmt::print(
                     "┌{0:─^{1}}┐\n"
@@ -617,11 +614,11 @@ void processDataset(Dataset<T>* dataset, const Args& args, std::set<unsigned int
                     "Type", "Sliding window",
                     "Window size (w)", args.windowSize,
                     "Slide size (s)", args.slideSize,
+                    "Radius (r)", r,
                     "Min. neighbors (k)", args.k,
-                    "Threshold", t,
                     ""
             );
-            result = executeSlidingWindow<T>(dataset, deviceData, args, deviceTimer, t);
+            result = executeSlidingWindow<T>(dataset, deviceData, args, deviceTimer, r);
         }
 
         if (!groundTruth.empty()) {
@@ -630,7 +627,7 @@ void processDataset(Dataset<T>* dataset, const Args& args, std::set<unsigned int
 
 
         if (!args.output.empty()) {
-            writeOutput(args.output, t, result);
+            writeOutput(args.output, r, args.k, result);
         }
 
 

@@ -110,9 +110,13 @@ std::set<unsigned int> readGroundTruth(std::string& path) {
 }
 
 
-void writeCountsResult(std::vector<unsigned int> counts, std::string& output) {
+void writeCountsResult(std::vector<unsigned int> counts,
+                       double threshold,
+                       unsigned int k,
+                       const std::string& output) {
     std::ofstream file;
     file.open(output.c_str());
+    fmt::print(file, "Radius={}, k={}\n", threshold, k);
 
     for (unsigned int i = 0; i < counts.size(); ++i) {
         fmt::print(file, "Run({}): {}\n", i, counts[i]);
@@ -121,9 +125,13 @@ void writeCountsResult(std::vector<unsigned int> counts, std::string& output) {
     file.close();
 }
 
-void writeOutliersResult(std::vector<unsigned int> outliers, std::string& output) {
+void writeOutliersResult(std::vector<unsigned int> outliers,
+                         double threshold,
+                         unsigned int k,
+                         const std::string& output) {
     std::ofstream file;
     file.open(output.c_str());
+    fmt::print(file, "Radius={}, k={}\n", threshold, k);
 
     for (unsigned int i = 0; i < outliers.size(); ++i) {
         fmt::print(file, "{}\n", outliers[i]);
