@@ -17,6 +17,7 @@ struct Args {
     std::string weightsFile;
     std::string groundTruthFile;
     std::string precision = "float";
+    bool withID = false;
     bool skipHeader = false;
     bool hasWeights = false;
     unsigned int cardinality{};
@@ -85,6 +86,7 @@ int main(int argc, char** argv) {
 
         options.add_options()
                 ("i,input", "Input dataset path", cxxopts::value<std::string>(args.input))
+                ("with-id", "Input records have ID", cxxopts::value<bool>(args.withID))
                 ("o,output", "Output result path", cxxopts::value<std::string>(args.output))
                 ("p,precision", "Precision type", cxxopts::value<std::string>(args.precision))
                 ("skip-header", "Skip input dataset header", cxxopts::value<bool>(args.skipHeader))
@@ -157,11 +159,19 @@ int main(int argc, char** argv) {
         }
 
         if (args.precision == "float") {
-            processDataset<float>(new Dataset<float>(args.input, args.cardinality, args.dimensions, args.skipHeader),
+            processDataset<float>(new Dataset<float>(args.input,
+                                                     args.cardinality,
+                                                     args.dimensions,
+                                                     args.skipHeader,
+                                                     args.withID),
                                   args,
                                   groundTruth);
         } else {
-            processDataset<double>(new Dataset<double>(args.input, args.cardinality, args.dimensions, args.skipHeader),
+            processDataset<double>(new Dataset<double>(args.input,
+                                                       args.cardinality,
+                                                       args.dimensions,
+                                                       args.skipHeader,
+                                                       args.withID),
                                    args,
                                    groundTruth);
         }
@@ -344,8 +354,9 @@ void freeDeviceMemory(DeviceData<T>& deviceData)
 }
 
 template<typename T>
-std::vector<unsigned int> extractResults(DeviceData<T>& deviceData, unsigned int startID, unsigned int endID,
-                                         unsigned int offset, unsigned int size, unsigned int k)
+std::vector<unsigned int> extractResults(Dataset<T>* dataset, DeviceData<T>& deviceData,
+                                         unsigned int startID, unsigned int endID,
+                                         unsigned int offset, unsigned int size, unsigned int k, bool withID)
 {
     unsigned int deviceRes = thrust::transform_reduce(thrust::device,
                                                       thrust::device_ptr<unsigned int>(deviceData.neighbors + offset),
@@ -363,7 +374,13 @@ std::vector<unsigned int> extractResults(DeviceData<T>& deviceData, unsigned int
 
     std::vector<unsigned int> tmp(deviceRes);
     errorCheck(cudaMemcpy(&tmp[0], deviceData.outliers, sizeof(unsigned int) * deviceRes, cudaMemcpyDeviceToHost))
-
+    if (withID) {
+        std::vector<unsigned int> outliers;
+        for (auto& pos : tmp) {
+            outliers.push_back(dataset->ids[pos]);
+        }
+        return outliers;
+    }
     return tmp;
 }
 
@@ -416,8 +433,14 @@ Result executeFixed(Dataset<T>* dataset, DeviceData<T>& deviceData, const Args& 
         DeviceTimer::finish(calc);
 
         EventPair* extractRes = deviceTimer.add("Extract results");
-        std::vector<unsigned int> tmp = extractResults<T>(deviceData, currentStart, currentStart + args.slideSize,
-                                                          args.fixedPoints, size, args.k);
+        std::vector<unsigned int> tmp = extractResults<T>(dataset,
+                                                          deviceData,
+                                                          currentStart,
+                                                          currentStart + args.slideSize,
+                                                          args.fixedPoints,
+                                                          size,
+                                                          args.k,
+                                                          args.withID);
         DeviceTimer::finish(extractRes);
 
         result.outliers.insert(result.outliers.end(), tmp.begin(), tmp.end());
@@ -487,12 +510,14 @@ Result executeSlidingWindow(Dataset<T>* dataset, DeviceData<T>& deviceData, cons
         DeviceTimer::finish(calc);
 
         EventPair* extractRes = deviceTimer.add("Extract results");
-        std::vector<unsigned int> tmp = extractResults<T>(deviceData,
+        std::vector<unsigned int> tmp = extractResults<T>(dataset,
+                                                          deviceData,
                                                           currentStart * args.slideSize,
                                                           (currentStart * args.slideSize) + currentSize,
                                                           0,
                                                           currentSize,
-                                                          args.k);
+                                                          args.k,
+                                                          args.withID);
         DeviceTimer::finish(extractRes);
 
         result.outliers.insert(result.outliers.end(), tmp.begin(), tmp.end());

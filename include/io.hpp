@@ -30,8 +30,9 @@ struct Dataset {
     T* pointsRow;
     T* pointsCol;
     T* weights;
+    std::vector<unsigned int> ids;
 
-    Dataset(std::string& path, unsigned int cardinality, unsigned int dimensions, bool skipHeader) :
+    Dataset(std::string& path, unsigned int cardinality, unsigned int dimensions, bool skipHeader, bool withID) :
             cardinality(cardinality), dimensions(dimensions) {
         std::ifstream infile;
         std::string line;
@@ -51,8 +52,12 @@ struct Dataset {
             std::getline(infile, line);
             if (line.empty()) continue;
             std::vector<T> v = split<T>(line, ',');
-            for (auto& point: v) {
-                this->pointsRow[i++] = point;
+            if (withID) {
+                ids.push_back((unsigned int)v[0]);
+            }
+
+            for (unsigned int j = withID ? 1 : 0; j < v.size(); ++j) {
+                this->pointsRow[i++] = v[j];
             }
         }
 
@@ -96,8 +101,6 @@ std::set<unsigned int> readGroundTruth(std::string& path) {
     std::ifstream infile;
     std::string line;
     infile.open(path.c_str());
-
-    std::getline(infile, line);
 
     while (!infile.eof()) {
         std::getline(infile, line);
